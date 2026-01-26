@@ -1,0 +1,2300 @@
+--- PROJECT STRUCTURE & CODE SUMMARY ---
+
+=== FILE TREE ===
+config\db.js
+controllers\adminController.js
+controllers\authController.js
+controllers\couponAdminController.js
+controllers\couponController.js
+controllers\inventoryController.js
+controllers\loyaltyController.js
+controllers\newsController.js
+controllers\rankController.js
+controllers\settingsController.js
+controllers\shopController.js
+controllers\userController.js
+middleware\adminMiddleware.js
+middleware\authMiddleware.js
+package.json
+routes\adminRoutes.js
+routes\authRoutes.js
+routes\couponAdminRoutes.js
+routes\couponRoutes.js
+routes\inventoryRoutes.js
+routes\loyaltyRoutes.js
+routes\newsRoutes.js
+routes\rankRoutes.js
+routes\settingsRoutes.js
+routes\shopRoutes.js
+routes\userRoutes.js
+server.js
+utils\referralCodec.js
+utils\rewardSystem.js
+
+=========================================
+
+
+vvvvvvvvvv FILE START: config\db.js vvvvvvvvvv
+const sql = require('mssql');
+require('dotenv').config();
+
+// قراءة الإعدادات من ملف .env
+const config = {
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    server: process.env.DB_SERVER, 
+    database: process.env.DB_NAME,
+    options: {
+        encrypt: false, // اجعله true إذا كنت تستخدم Azure Cloud
+        trustServerCertificate: true, // ضروري جداً للاتصال المحلي (Localhost)
+        enableArithAbort: true
+    }
+};
+
+// إنشاء "مسبح اتصال" (Connection Pool) لضمان السرعة وعدم قطع الاتصال
+const poolPromise = new sql.ConnectionPool(config)
+    .connect()
+    .then(pool => {
+        console.log('✅ Connected to SQL Server (AdrenalineWeb) Successfully!');
+        return pool;
+    })
+    .catch(err => {
+        console.error('❌ Database Connection Failed! Error: ', err);
+        process.exit(1); // إيقاف السيرفر في حال فشل الاتصال
+    });
+
+module.exports = {
+    sql,
+    poolPromise
+};
+^^^^^^^^^^ FILE END: config\db.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\adminController.js vvvvvvvvvv
+const { poolPromise, sql } = require('../config/db');
+
+// 1. حظر لاعب (Ban Player)
+exports.banPlayer = async (req, res) => {
+    const { targetUserNo, reason } = req.body;
+    const adminName = req.user.userId;
+
+    try {
+        const pool = await poolPromise;
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const request = new sql.Request(transaction);
+
+            // أ. تفعيل الحظر في جدول الحسابات الأصلي (AuthDB)
+            // (هذا ما يمنعه من دخول اللعبة)
+            await request.query(`UPDATE AuthDB.dbo.T_Account SET IsBanned = 1 WHERE UserNo = ${targetUserNo}`);
+
+            // ب. تسجيل التفاصيل في موقعنا (للعرض)
+            await request.input('uid', targetUserNo)
+                         .input('reason', reason)
+                         .input('admin', adminName)
+                         .query(`
+                            INSERT INTO AdrenalineWeb.dbo.Web_BanLog (UserNo, Reason, BannedBy, IsActive)
+                            VALUES (@uid, @reason, @admin, 1)
+                         `);
+
+            await transaction.commit();
+            res.json({ status: 'success', message: 'تم حظر اللاعب بنجاح' });
+
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
+    } catch (err) {
+        res.status(500).json({ message: 'فشل الحظر', error: err.message });
+    }
+};
+
+// 2. عرض طلبات فك الحظر (Unban Requests)
+exports.getUnbanRequests = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request().query(`
+            SELECT 
+                R.RequestID, R.UserNo, R.FineAmount, R.PaymentType, R.RequestDate,
+                U.UserId AS Username,
+                (SELECT TOP 1 Nickname FROM GameDB.dbo.T_User WHERE UserNo = R.UserNo) AS Nickname,
+                (SELECT TOP 1 Reason FROM AdrenalineWeb.dbo.Web_BanLog WHERE UserNo = R.UserNo AND IsActive = 1 ORDER BY BanID DESC) AS BanReason
+            FROM AdrenalineWeb.dbo.Web_UnbanRequests R
+            JOIN AuthDB.dbo.T_Account U ON R.UserNo = U.UserNo
+            WHERE R.Status = 'Pending'
+            ORDER BY R.RequestDate ASC
+        `);
+
+        res.json({ status: 'success', requests: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب الطلبات', error: err.message });
+    }
+};
+
+// 3. الموافقة على طلب فك الحظر (Approve & Deduct Money)
+exports.approveUnban = async (req, res) => {
+    const { requestId } = req.body;
+    
+    try {
+        const pool = await poolPromise;
+        
+        // أ. جلب تفاصيل الطلب
+        const reqResult = await pool.request()
+            .input('rid', requestId)
+            .query('SELECT * FROM AdrenalineWeb.dbo.Web_UnbanRequests WHERE RequestID = @rid');
+            
+        const banRequest = reqResult.recordset[0];
+        if (!banRequest || banRequest.Status !== 'Pending') {
+            return res.status(404).json({ message: 'الطلب غير موجود أو تمت معالجته مسبقاً' });
+        }
+
+        // ب. التحقق من رصيد اللاعب (هل يملك قيمة الغرامة؟)
+        // ملاحظة: نفترض الدفع بـ GP (GameMoney)
+        const userCheck = await pool.request()
+            .input('uid', banRequest.UserNo)
+            .query('SELECT GameMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid');
+            
+        const currentMoney = userCheck.recordset[0].GameMoney;
+
+        if (currentMoney < banRequest.FineAmount) {
+            return res.status(400).json({ message: 'اللاعب لا يملك رصيداً كافياً لدفع الغرامة' });
+        }
+
+        // ج. تنفيذ العملية: خصم المال + فك الحظر
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const request = new sql.Request(transaction);
+
+            // 1. خصم الغرامة
+            await request.query(`
+                UPDATE GameDB.dbo.T_User 
+                SET GameMoney = GameMoney - ${banRequest.FineAmount} 
+                WHERE UserNo = ${banRequest.UserNo}
+            `);
+
+            // 2. فك الحظر في AuthDB
+            await request.query(`UPDATE AuthDB.dbo.T_Account SET IsBanned = 0 WHERE UserNo = ${banRequest.UserNo}`);
+
+            // 3. تحديث حالة الطلب
+            await request.query(`UPDATE AdrenalineWeb.dbo.Web_UnbanRequests SET Status = 'Approved' WHERE RequestID = ${requestId}`);
+
+            // 4. إغلاق سجل الحظر
+            await request.query(`UPDATE AdrenalineWeb.dbo.Web_BanLog SET IsActive = 0 WHERE UserNo = ${banRequest.UserNo}`);
+
+            await transaction.commit();
+            res.json({ status: 'success', message: 'تم فك الحظر وخصم الغرامة بنجاح' });
+
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
+
+    } catch (err) {
+        res.status(500).json({ message: 'فشل العملية', error: err.message });
+    }
+    // ... (الكود السابق: banPlayer, unban, etc...)
+
+// 🆕 تغيير بيانات اللاعب بالقوة (للأدمن فقط)
+exports.forceChangeCredentials = async (req, res) => {
+    // نطلب: اسم اللاعب المستهدف، (اختياري: باسورد جديد)، (اختياري: إيميل جديد)
+    const { targetUsername, newPassword, newEmail } = req.body;
+
+    if (!targetUsername) {
+        return res.status(400).json({ message: 'يجب تحديد اسم المستخدم (Target Username)' });
+    }
+
+    if (!newPassword && !newEmail) {
+        return res.status(400).json({ message: 'يجب إرسال كلمة مرور جديدة أو إيميل جديد لتغييره' });
+    }
+
+    try {
+        const pool = await poolPromise;
+
+        // 1. التحقق من وجود اللاعب
+        const userCheck = await pool.request()
+            .input('uid', targetUsername)
+            .query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE UserId = @uid");
+
+        if (userCheck.recordset.length === 0) {
+            return res.status(404).json({ message: 'هذا اللاعب غير موجود' });
+        }
+
+        const targetUserNo = userCheck.recordset[0].UserNo;
+
+        // 2. تغيير الإيميل (إذا تم إرساله)
+        if (newEmail) {
+            // التأكد أن الإيميل غير مستخدم من قبل شخص آخر
+            const emailCheck = await pool.request()
+                .input('email', newEmail)
+                .input('uid', targetUserNo) // استثناء اللاعب نفسه
+                .query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE Email = @email AND UserNo != @uid");
+
+            if (emailCheck.recordset.length > 0) {
+                return res.status(400).json({ message: 'البريد الإلكتروني الجديد مستخدم بالفعل في حساب آخر' });
+            }
+
+            // تحديث الإيميل + تفعيله فوراً (لأن الأدمن هو من قام بالتغيير)
+            await pool.request()
+                .input('email', newEmail)
+                .input('uid', targetUserNo)
+                .query("UPDATE AuthDB.dbo.T_Account SET Email = @email, IsEmailVerified = 1, VerificationToken = NULL WHERE UserNo = @uid");
+        }
+
+        // 3. تغيير الباسورد (إذا تم إرساله)
+        if (newPassword) {
+            await pool.request()
+                .input('pass', newPassword)
+                .input('uid', targetUserNo)
+                .query("UPDATE AuthDB.dbo.T_Account SET Password = @pass, PasswordResetToken = NULL WHERE UserNo = @uid");
+        }
+
+        res.json({ 
+            status: 'success', 
+            message: `تم تحديث بيانات اللاعب [${targetUsername}] بنجاح.`,
+            details: {
+                emailUpdated: newEmail ? true : false,
+                passwordUpdated: newPassword ? true : false
+            }
+        });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'حدث خطأ أثناء التحديث', error: err.message });
+    }
+};
+};
+^^^^^^^^^^ FILE END: controllers\adminController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\authController.js vvvvvvvvvv
+const { poolPromise, sql } = require('../config/db');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
+const { v4: uuidv4 } = require('uuid');
+const { decodeReferralCode } = require('../utils/referralCodec');
+require('dotenv').config(); // 👈 مهم لقراءة الإيميل والباسورد من الملف السري
+
+const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_adrenaline_key_2026';
+
+// 📧 إعدادات إرسال الإيميل (يقرأ الآن من ملف .env)
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER, // يقرأ من ملف .env
+        pass: process.env.EMAIL_PASS  // يقرأ من ملف .env
+    },
+    tls: {
+        rejectUnauthorized: false // يساعد في تجنب مشاكل الاتصال
+    }
+});
+
+// 1. تسجيل الدخول (Login) - (تم تعديله ليدعم ميزة تغيير الإيميل)
+exports.login = async (req, res) => {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+        return res.status(400).json({ message: 'الرجاء إدخال اسم المستخدم وكلمة المرور' });
+    }
+
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request()
+            .input('uid', username)
+            .query(`
+                SELECT A.UserNo, A.UserId, A.Password, A.IsBanned, A.IsEmailVerified, A.Email, -- 👈 أضفنا Email هنا
+                       U.GMGrade, U.Nickname 
+                FROM AuthDB.dbo.T_Account A
+                LEFT JOIN GameDB.dbo.T_User U ON A.UserNo = U.UserNo 
+                WHERE A.UserId = @uid
+            `);
+
+        const user = result.recordset[0];
+
+        if (!user) return res.status(404).json({ message: 'اسم المستخدم غير موجود' });
+        if (user.Password !== password) return res.status(401).json({ message: 'كلمة المرور غير صحيحة' });
+        
+        // التحقق من تفعيل الإيميل (التعديل الجديد)
+        if (user.IsEmailVerified === false) {
+            return res.status(403).json({ 
+                message: 'يجب تأكيد البريد الإلكتروني أولاً. راجع صندوق الوارد.',
+                errorType: 'NOT_VERIFIED', // كود ليستخدمه الموقع لإظهار الأزرار
+                currentEmail: user.Email   // نرسل الإيميل الحالي ليعرف اللاعب أين الخطأ
+            });
+        }
+
+        const isBanned = user.IsBanned === 1 || user.IsBanned === true;
+        const token = jwt.sign(
+            { userNo: user.UserNo, userId: user.UserId, isAdmin: user.GMGrade >= 1, isBanned: isBanned },
+            JWT_SECRET, { expiresIn: '24h' }
+        );
+
+        res.json({
+            status: 'success',
+            message: 'تم تسجيل الدخول بنجاح',
+            token: token,
+            user: {
+                userNo: user.UserNo,
+                username: user.UserId,
+                nickname: user.Nickname || null,
+                isGM: user.GMGrade >= 1,
+                isBanned: isBanned
+            }
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'حدث خطأ في السيرفر', error: err.message });
+    }
+};
+
+// 2. إنشاء حساب جديد (Register) - (كما هو تماماً في نسختك)
+exports.register = async (req, res) => {
+    // 👇 التعديل هنا: استخدام userid و referralCode ليطابق Postman
+    const { userid, password, email, referralCode } = req.body;
+
+    console.log('بيانات التسجيل:', req.body); // للتأكد في الكونسول
+
+    // التحقق من المتغيرات بالأسماء الجديدة
+    if (!userid || !password || !email) {
+        return res.status(400).json({ message: 'البيانات ناقصة: تأكد من إرسال userid, password, email' });
+    }
+
+    try {
+        const pool = await poolPromise;
+
+        // 1. التحقق من التكرار
+        const check = await pool.request()
+            .input('uid', userid)
+            .input('email', email)
+            .query('SELECT UserId FROM AuthDB.dbo.T_Account WHERE UserId = @uid OR Email = @email');
+        
+        if (check.recordset.length > 0) {
+            return res.status(400).json({ message: 'اسم المستخدم أو البريد مسجل مسبقاً' });
+        }
+
+        // 2. معالجة كود الدعوة (تحويل الكود النصي إلى رقم)
+        let referrerUserNo = null;
+        if (referralCode) {
+            const decodedId = decodeReferralCode(referralCode);
+            if (decodedId) {
+                // التأكد من أن الداعي موجود فعلاً
+                const refCheck = await pool.request().query(`SELECT UserNo FROM AuthDB.dbo.T_Account WHERE UserNo = ${decodedId}`);
+                if (refCheck.recordset.length > 0) {
+                    referrerUserNo = decodedId;
+                }
+            }
+        }
+
+        // 3. الإدخال في قاعدة البيانات
+        const verificationToken = require('crypto').randomBytes(32).toString('hex');
+
+        await pool.request()
+            .input('uid', userid)
+            .input('pass', password) 
+            .input('email', email)
+            .input('token', verificationToken)
+            .input('ref', referrerUserNo) // 👈 إدخال رقم الداعي
+            .query(`
+                INSERT INTO AuthDB.dbo.T_Account 
+                (UserId, Password, Email, IsEmailVerified, VerificationToken, ReferredBy, RegDate, IsBanned)
+                VALUES 
+                (@uid, @pass, @email, 0, @token, @ref, GETDATE(), 0)
+            `);
+
+        res.json({ status: 'success', message: 'تم التسجيل بنجاح!' });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل التسجيل', error: err.message });
+    }
+};
+
+// 3. تفعيل الإيميل (كما هو في نسختك)
+// تحديث: دالة تفعيل الإيميل + مكافأة الداعي
+exports.verifyEmail = async (req, res) => {
+    const { token } = req.query;
+
+    if (!token) return res.status(400).json({ message: 'رمز التفعيل مفقود' });
+
+    try {
+        const pool = await poolPromise;
+
+        // 1. جلب بيانات اللاعب والداعي
+        const checkResult = await pool.request()
+            .input('token', token)
+            .query(`
+                SELECT UserNo, UserId, IsEmailVerified, ReferredBy 
+                FROM AuthDB.dbo.T_Account 
+                WHERE VerificationToken = @token
+            `);
+
+        const user = checkResult.recordset[0];
+
+        if (!user) return res.status(400).json({ message: 'رابط التفعيل غير صالح' });
+        if (user.IsEmailVerified) return res.status(400).json({ message: 'الحساب مفعل مسبقاً' });
+
+        // 2. بدء التفعيل
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const request = new sql.Request(transaction);
+
+            // أ. تفعيل الحساب
+            await request.query(`
+                UPDATE AuthDB.dbo.T_Account 
+                SET IsEmailVerified = 1, VerificationToken = NULL 
+                WHERE UserNo = ${user.UserNo}
+            `);
+
+            // ب. نظام المكافأة (إذا كان هناك داعي)
+            if (user.ReferredBy && user.ReferredBy > 0) {
+                
+                // جلب الإعدادات + عدد الدعوات الحالية للداعي
+                const inviteCheck = await request.query(`
+                    SELECT 
+                        (SELECT COUNT(*) FROM AuthDB.dbo.T_Account WHERE ReferredBy = ${user.ReferredBy} AND IsEmailVerified = 1) AS CurrentInvites,
+                        (SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'ReferralMaxCount') AS MaxLimit,
+                        (SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'ReferralRewardPoints') AS PointsVal
+                `);
+
+                const currentInvites = inviteCheck.recordset[0].CurrentInvites;
+                const maxLimit = parseInt(inviteCheck.recordset[0].MaxLimit) || 50;
+                const rewardPoints = parseInt(inviteCheck.recordset[0].PointsVal) || 10;
+
+                // التحقق: هل وصل للحد الأقصى؟
+                if (currentInvites < maxLimit) {
+                    // إضافة النقاط للداعي
+                    await request.query(`
+                        UPDATE AuthDB.dbo.T_Account 
+                        SET LoyaltyPoints = LoyaltyPoints + ${rewardPoints} 
+                        WHERE UserNo = ${user.ReferredBy}
+                    `);
+
+                    // تسجيل العملية
+                    await request.query(`
+                        INSERT INTO AdrenalineWeb.dbo.Web_LoyaltyLog (UserNo, PointsSpent, RewardType, RewardAmount, Date)
+                        VALUES (${user.ReferredBy}, 0, 'REFERRAL_REWARD', ${rewardPoints}, GETDATE())
+                    `);
+                }
+            }
+
+            await transaction.commit();
+            
+            res.send(`
+                <h1 style="color:green; text-align:center;">تم تفعيل حسابك بنجاح!</h1>
+                <p style="text-align:center;">يمكنك الآن الدخول للعبة.</p>
+            `);
+
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).send('<h1>حدث خطأ أثناء التفعيل</h1>');
+    }
+};
+
+// 🆕 4. دالة جديدة: إعادة إرسال رابط التفعيل (Resend Verification)
+exports.resendVerification = async (req, res) => {
+    const { username, password } = req.body; 
+
+    try {
+        const pool = await poolPromise;
+        const userCheck = await pool.request()
+            .input('uid', username)
+            .query("SELECT UserNo, Email, Password, IsEmailVerified FROM AuthDB.dbo.T_Account WHERE UserId = @uid");
+
+        const user = userCheck.recordset[0];
+        if (!user) return res.status(404).json({ message: 'المستخدم غير موجود' });
+        if (user.Password !== password) return res.status(401).json({ message: 'كلمة المرور خطأ' });
+        if (user.IsEmailVerified) return res.status(400).json({ message: 'الحساب مفعل بالفعل!' });
+
+        const newToken = uuidv4();
+        await pool.request()
+            .input('token', newToken)
+            .input('uid', user.UserNo)
+            .query("UPDATE AuthDB.dbo.T_Account SET VerificationToken = @token WHERE UserNo = @uid");
+
+        const verifyLink = `http://localhost:3000/api/auth/verify-email?token=${newToken}`;
+        
+        await transporter.sendMail({
+            from: `"Adrenaline Game" <${process.env.EMAIL_USER}>`,
+            to: user.Email,
+            subject: 'إعادة إرسال رابط التفعيل',
+            html: `<h3>مرحباً ${username}</h3><p>طلب جديد لتفعيل الحساب:</p><a href="${verifyLink}">تفعيل الحساب الآن</a>`
+        });
+
+        res.json({ status: 'success', message: `تم إرسال الرابط مجدداً إلى ${user.Email}` });
+
+    } catch (err) {
+        res.status(500).json({ message: 'فشل الإرسال' });
+    }
+};
+
+// 🆕 5. دالة جديدة: تصحيح الإيميل وإعادة الإرسال (Change Email & Resend)
+exports.changePendingEmail = async (req, res) => {
+    const { username, password, newEmail } = req.body;
+
+    if (!newEmail) return res.status(400).json({ message: 'يجب إدخال البريد الجديد' });
+
+    try {
+        const pool = await poolPromise;
+
+        const userCheck = await pool.request()
+            .input('uid', username)
+            .query("SELECT UserNo, Password, IsEmailVerified FROM AuthDB.dbo.T_Account WHERE UserId = @uid");
+
+        const user = userCheck.recordset[0];
+        if (!user) return res.status(404).json({ message: 'المستخدم غير موجود' });
+        if (user.Password !== password) return res.status(401).json({ message: 'كلمة المرور خطأ' });
+        if (user.IsEmailVerified) return res.status(400).json({ message: 'لا يمكن تغيير البريد، الحساب مفعل بالفعل.' });
+
+        // التأكد أن البريد الجديد غير مستخدم
+        const emailCheck = await pool.request()
+            .input('email', newEmail)
+            .query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE Email = @email");
+        
+        if (emailCheck.recordset.length > 0) return res.status(400).json({ message: 'هذا البريد مستخدم بحساب آخر' });
+
+        const newToken = uuidv4();
+        await pool.request()
+            .input('email', newEmail)
+            .input('token', newToken)
+            .input('uid', user.UserNo)
+            .query("UPDATE AuthDB.dbo.T_Account SET Email = @email, VerificationToken = @token WHERE UserNo = @uid");
+
+        const verifyLink = `http://localhost:3000/api/auth/verify-email?token=${newToken}`;
+        
+        await transporter.sendMail({
+            from: `"Adrenaline Game" <${process.env.EMAIL_USER}>`,
+            to: newEmail,
+            subject: 'تفعيل الحساب (بريد جديد)',
+            html: `<h3>تم تحديث بريدك بنجاح!</h3><p>اضغط هنا لتفعيل الحساب:</p><a href="${verifyLink}">تفعيل الحساب</a>`
+        });
+
+        res.json({ status: 'success', message: `تم تحديث البريد إلى ${newEmail} وإرسال الرابط.` });
+
+    } catch (err) {
+        res.status(500).json({ message: 'فشل التحديث' });
+    }
+};
+
+// 6. طلب استعادة كلمة المرور (كما هو في نسختك)
+// ... (بقية الكود في الأعلى كما هو: login, register, verifyEmail, etc...)
+
+// -------------------------------------------------------------------------
+// منطقة استعادة كلمة المرور (بدون ملفات HTML خارجية)
+// -------------------------------------------------------------------------
+
+// 6. طلب استعادة كلمة المرور (Forgot Password)
+exports.forgotPassword = async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: 'الرجاء إدخال البريد الإلكتروني' });
+
+    try {
+        const pool = await poolPromise;
+        // التحقق من وجود الإيميل
+        const userCheck = await pool.request().input('email', email).query("SELECT UserNo, UserId FROM AuthDB.dbo.T_Account WHERE Email = @email");
+
+        if (userCheck.recordset.length === 0) return res.status(404).json({ message: 'البريد الإلكتروني غير مسجل' });
+
+        const resetToken = uuidv4();
+        const username = userCheck.recordset[0].UserId;
+
+        // حفظ التوكن
+        await pool.request()
+            .input('token', resetToken)
+            .input('email', email)
+            .query(`UPDATE AuthDB.dbo.T_Account SET PasswordResetToken = @token, ResetTokenExpiry = DATEADD(HOUR, 1, GETDATE()) WHERE Email = @email`);
+
+        // 👇 التغيير هنا: الرابط يشير لصفحة تولدها السيرفر مباشرة
+        const resetLink = `http://localhost:3000/api/auth/reset-password-page?token=${resetToken}`;
+
+        // إرسال الإيميل
+        await transporter.sendMail({
+            from: `"Adrenaline Support" <${process.env.EMAIL_USER}>`,
+            to: email,
+            subject: 'استعادة كلمة المرور',
+            html: `
+                <div style="font-family: Arial; text-align: center;">
+                    <h3>تغيير كلمة المرور</h3>
+                    <p>مرحباً ${username}، لاستعادة كلمة المرور اضغط هنا:</p>
+                    <a href="${resetLink}" style="background-color: #333; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">تغيير كلمة المرور</a>
+                </div>
+            `
+        });
+
+        res.json({ status: 'success', message: 'تم إرسال رابط الاستعادة للإيميل.' });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل إرسال الطلب' });
+    }
+};
+
+// 🆕 7. عرض صفحة تغيير الباسورد (GET Request)
+// هذه الدالة ترسم صفحة HTML مباشرة في المتصفح بدون ملف خارجي
+exports.getResetPasswordPage = (req, res) => {
+    const { token } = req.query;
+
+    if (!token) return res.send('<h1>رابط غير صالح</h1>');
+
+    // نرسل كود HTML بسيط يحتوي على فورم وإسكربت
+    res.send(`
+        <!DOCTYPE html>
+        <html dir="rtl">
+        <head>
+            <meta charset="UTF-8">
+            <title>تغيير كلمة المرور</title>
+            <style>
+                body { font-family: Arial; background: #222; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+                .box { background: #333; padding: 30px; border-radius: 10px; text-align: center; width: 300px; box-shadow: 0 0 15px rgba(0,0,0,0.5); }
+                input { width: 90%; padding: 10px; margin: 10px 0; border-radius: 5px; border: none; }
+                button { width: 100%; padding: 10px; background: #e74c3c; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
+                button:hover { background: #c0392b; }
+            </style>
+        </head>
+        <body>
+            <div class="box">
+                <h2>كلمة المرور الجديدة 🔐</h2>
+                <input type="password" id="newPass" placeholder="أكتب كلمة المرور الجديدة">
+                <button onclick="savePassword()">حفظ التغييرات</button>
+                <p id="msg"></p>
+            </div>
+
+            <script>
+                async function savePassword() {
+                    const pass = document.getElementById('newPass').value;
+                    const token = "${token}"; // السيرفر يضع التوكن هنا تلقائياً
+                    
+                    if(!pass) return alert('أكتب كلمة المرور!');
+
+                    const res = await fetch('/api/auth/reset-password', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ token: token, newPassword: pass })
+                    });
+
+                    const data = await res.json();
+                    const msg = document.getElementById('msg');
+                    
+                    if(data.status === 'success') {
+                        msg.style.color = 'lightgreen';
+                        msg.innerText = 'تم التغيير بنجاح! يمكنك إغلاق الصفحة.';
+                        document.getElementById('newPass').value = '';
+                    } else {
+                        msg.style.color = 'red';
+                        msg.innerText = data.message;
+                    }
+                }
+            </script>
+        </body>
+        </html>
+    `);
+};
+
+// 8. تنفيذ التغيير (POST Request) - (نفس الدالة السابقة)
+exports.resetPassword = async (req, res) => {
+    const { token, newPassword } = req.body;
+    // ... (نفس الكود السابق تماماً) ...
+    if (!token || !newPassword) return res.status(400).json({ message: 'البيانات ناقصة' });
+
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request().input('token', token).query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE PasswordResetToken = @token AND ResetTokenExpiry > GETDATE()");
+
+        if (result.recordset.length === 0) return res.status(400).json({ message: 'الرابط منتهي أو غير صالح' });
+
+        await pool.request().input('pass', newPassword).input('uid', result.recordset[0].UserNo).query("UPDATE AuthDB.dbo.T_Account SET Password = @pass, PasswordResetToken = NULL, ResetTokenExpiry = NULL WHERE UserNo = @uid");
+
+        res.json({ status: 'success', message: 'تم تغيير كلمة المرور بنجاح' });
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ سيرفر' });
+    }
+};
+
+// 7. تنفيذ تغيير كلمة المرور (كما هو في نسختك)
+exports.resetPassword = async (req, res) => {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) return res.status(400).json({ message: 'البيانات ناقصة' });
+
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request().input('token', token).query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE PasswordResetToken = @token AND ResetTokenExpiry > GETDATE()");
+
+        if (result.recordset.length === 0) return res.status(400).json({ message: 'الرابط منتهي أو غير صالح' });
+
+        await pool.request().input('pass', newPassword).input('uid', result.recordset[0].UserNo).query("UPDATE AuthDB.dbo.T_Account SET Password = @pass, PasswordResetToken = NULL, ResetTokenExpiry = NULL WHERE UserNo = @uid");
+
+        res.json({ status: 'success', message: 'تم تغيير كلمة المرور بنجاح' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل تغيير كلمة المرور' });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\authController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\couponAdminController.js vvvvvvvvvv
+const { poolPromise, sql } = require('../config/db');
+
+// دالة مساعدة لتوليد حروف عشوائية
+const generateSegment = (length) => {
+    const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+};
+
+// دالة مساعدة لتنسيق القيمة لـ SQL (إما رقم أو كلمة NULL)
+const fmtVal = (val) => val ? val : 'NULL';
+
+// 1. إنشاء حزمة قسائم للبيع (Bundle)
+exports.createBundle = async (req, res) => {
+    const { name, desc, priceGP, publicFee, items } = req.body;
+
+    try {
+        const pool = await poolPromise;
+        const request = pool.request()
+            .input('name', name)
+            .input('desc', desc)
+            .input('price', priceGP)
+            .input('fee', publicFee || 2000);
+
+        // تجهيز القيم: إذا لم يوجد العنصر نستخدم 0 للمتجر (لان Web_CouponShop يفضل 0)
+        // لكن إذا أردت NULL في المتجر أيضاً، غير 0 إلى 'NULL'
+        // ملاحظة: عادة جداول الويب تقبل 0 كقيمة افتراضية، لكن سنتركها 0 هنا لعدم تعقيد العرض
+        const safeItems = [];
+        for (let i = 0; i < 9; i++) {
+            safeItems[i] = items && items[i] ? items[i] : { id: 0, days: 0 };
+        }
+
+        await request.query(`
+            INSERT INTO AdrenalineWeb.dbo.Web_CouponShop 
+            (
+                BundleName, Description, PriceGP, PublicFeeGP, 
+                ItemId1, ItemDays1, ItemId2, ItemDays2, ItemId3, ItemDays3, 
+                ItemId4, ItemDays4, ItemId5, ItemDays5, ItemId6, ItemDays6, 
+                ItemId7, ItemDays7, ItemId8, ItemDays8, ItemId9, ItemDays9
+            )
+            VALUES 
+            (
+                @name, @desc, @price, @fee,
+                ${safeItems[0].id}, ${safeItems[0].days}, ${safeItems[1].id}, ${safeItems[1].days}, ${safeItems[2].id}, ${safeItems[2].days},
+                ${safeItems[3].id}, ${safeItems[3].days}, ${safeItems[4].id}, ${safeItems[4].days}, ${safeItems[5].id}, ${safeItems[5].days},
+                ${safeItems[6].id}, ${safeItems[6].days}, ${safeItems[7].id}, ${safeItems[7].days}, ${safeItems[8].id}, ${safeItems[8].days}
+            )
+        `);
+
+        res.json({ status: 'success', message: 'تم إنشاء الحزمة في المتجر بنجاح' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل إنشاء الحزمة', error: err.message });
+    }
+};
+
+// 2. إنشاء "قسيمة هدية" (Promo Code) - هنا التعديل المهم لـ NULL
+exports.createGiftCoupon = async (req, res) => {
+    const { customCode, expireDays, maxUses, items, gameMoney } = req.body; 
+
+    try {
+        const pool = await poolPromise;
+        
+        // توليد الكود
+        let serialKey = customCode;
+        if (!serialKey) {
+            serialKey = `${generateSegment(6)}-${generateSegment(6)}-${generateSegment(4)}`;
+        }
+        serialKey = serialKey.toUpperCase();
+
+        // تجهيز مصفوفة العناصر بقيم NULL إذا كانت فارغة
+        const dbItems = [];
+        for (let i = 0; i < 9; i++) {
+            if (items && items[i] && items[i].id > 0) {
+                dbItems[i] = { id: items[i].id, days: items[i].days };
+            } else {
+                dbItems[i] = { id: 'NULL', days: 'NULL' }; // 👈 نستخدم النص 'NULL'
+            }
+        }
+
+        const money = gameMoney || 0;
+
+        // الإدخال في GameDB باستخدام القيم التي قد تكون NULL
+        await pool.request().query(`
+            INSERT INTO GameDB.dbo.T_ItemSerialKey 
+            (
+                SerialKey, TargetUserNo, OneTimeKey, RegDate, ExpireDate, SupplyGameMoney,
+                SupplyItemId1, SupplyItemDays1, SupplyItemId2, SupplyItemDays2, SupplyItemId3, SupplyItemDays3,
+                SupplyItemId4, SupplyItemDays4, SupplyItemId5, SupplyItemDays5, SupplyItemId6, SupplyItemDays6,
+                SupplyItemId7, SupplyItemDays7, SupplyItemId8, SupplyItemDays8, SupplyItemId9, SupplyItemDays9
+            )
+            VALUES 
+            (
+                '${serialKey}', NULL, 0, GETDATE(), DATEADD(DAY, ${expireDays || 365}, GETDATE()), ${money},
+                ${dbItems[0].id}, ${dbItems[0].days}, ${dbItems[1].id}, ${dbItems[1].days}, ${dbItems[2].id}, ${dbItems[2].days},
+                ${dbItems[3].id}, ${dbItems[3].days}, ${dbItems[4].id}, ${dbItems[4].days}, ${dbItems[5].id}, ${dbItems[5].days},
+                ${dbItems[6].id}, ${dbItems[6].days}, ${dbItems[7].id}, ${dbItems[7].days}, ${dbItems[8].id}, ${dbItems[8].days}
+            )
+        `);
+
+        res.json({ status: 'success', message: `تم إنشاء كود الهدية: ${serialKey}`, code: serialKey });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل إنشاء الهدية', error: err.message });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\couponAdminController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\couponController.js vvvvvvvvvv
+const { poolPromise, sql } = require('../config/db');
+const { v4: uuidv4 } = require('uuid');
+const { rewardPointsOnPurchase } = require('../utils/rewardSystem'); // 👈 استيراد الدالة
+
+const generateSegment = (length) => {
+    const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    let result = '';
+    for (let i = 0; i < length; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+};
+
+// دالة لتحويل 0 إلى NULL (للاستخدام في استعلام SQL)
+const toSqlVal = (val) => {
+    // إذا كانت القيمة موجودة وأكبر من 0 نرجعها، وإلا نرجع النص 'NULL'
+    return (val && val > 0) ? val : 'NULL';
+};
+
+// ... (GetShopBundles تبقى كما هي) ...
+exports.getShopBundles = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request().query(`
+            SELECT BundleID, BundleName, Description, PriceGP, PublicFeeGP, 
+                   ItemId1, ItemDays1, ItemId2, ItemDays2, ItemId3, ItemDays3
+            FROM AdrenalineWeb.dbo.Web_CouponShop 
+            WHERE IsActive = 1
+        `);
+        res.json({ status: 'success', bundles: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ', error: err.message });
+    }
+};
+
+// 2. شراء حزمة وتوليد الكود (مع منطق NULL)
+exports.buyBundle = async (req, res) => {
+    const { bundleId, makePublic } = req.body; 
+    const userNo = req.user.userNo;
+
+    try {
+        const pool = await poolPromise;
+
+        // أ. جلب الحزمة
+        const bundleRes = await pool.request().input('bid', bundleId).query("SELECT * FROM AdrenalineWeb.dbo.Web_CouponShop WHERE BundleID = @bid");
+        const bundle = bundleRes.recordset[0];
+        if (!bundle) return res.status(404).json({ message: 'الحزمة غير موجودة' });
+
+        // ب. السعر والرصيد
+        let finalPrice = bundle.PriceGP;
+        if (makePublic) finalPrice += bundle.PublicFeeGP;
+
+        const userCheck = await pool.request().input('uid', userNo).query("SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid");
+        if (userCheck.recordset[0].CashMoney < finalPrice) {
+            return res.status(400).json({ message: `رصيدك غير كافٍ. المطلوب: ${finalPrice} GP` });
+        }
+
+        // ج. التنفيذ
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const request = new sql.Request(transaction);
+
+            // 1. خصم المال
+            await request.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - ${finalPrice} WHERE UserNo = ${userNo}`);
+
+            // 2. توليد الكود
+            const newSerial = `${generateSegment(6)}-${generateSegment(6)}-${generateSegment(4)}`;
+            const targetUserVal = makePublic ? 'NULL' : userNo;
+
+            // 3. إدخال الكود في GameDB (استخدام دالة toSqlVal لتحويل الأصفار إلى NULL) 🛠️
+            await request.query(`
+                INSERT INTO GameDB.dbo.T_ItemSerialKey 
+                (
+                    SerialKey, TargetUserNo, OneTimeKey, RegDate, ExpireDate, SupplyGameMoney,
+                    SupplyItemId1, SupplyItemDays1, SupplyItemId2, SupplyItemDays2, SupplyItemId3, SupplyItemDays3,
+                    SupplyItemId4, SupplyItemDays4, SupplyItemId5, SupplyItemDays5, SupplyItemId6, SupplyItemDays6,
+                    SupplyItemId7, SupplyItemDays7, SupplyItemId8, SupplyItemDays8, SupplyItemId9, SupplyItemDays9
+                )
+                VALUES 
+                (
+                    '${newSerial}', ${targetUserVal}, 1, GETDATE(), DATEADD(YEAR, 1, GETDATE()), ${bundle.GameMoney},
+                    ${toSqlVal(bundle.ItemId1)}, ${toSqlVal(bundle.ItemDays1)}, 
+                    ${toSqlVal(bundle.ItemId2)}, ${toSqlVal(bundle.ItemDays2)}, 
+                    ${toSqlVal(bundle.ItemId3)}, ${toSqlVal(bundle.ItemDays3)},
+                    ${toSqlVal(bundle.ItemId4)}, ${toSqlVal(bundle.ItemDays4)}, 
+                    ${toSqlVal(bundle.ItemId5)}, ${toSqlVal(bundle.ItemDays5)}, 
+                    ${toSqlVal(bundle.ItemId6)}, ${toSqlVal(bundle.ItemDays6)},
+                    ${toSqlVal(bundle.ItemId7)}, ${toSqlVal(bundle.ItemDays7)}, 
+                    ${toSqlVal(bundle.ItemId8)}, ${toSqlVal(bundle.ItemDays8)}, 
+                    ${toSqlVal(bundle.ItemId9)}, ${toSqlVal(bundle.ItemDays9)}
+                )
+            `);
+
+            // 4. تسجيل في الموقع
+            await request.query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_UserCoupons (UserNo, SerialKey, BundleID, IsPublic)
+                VALUES (${userNo}, '${newSerial}', ${bundleId}, ${makePublic ? 1 : 0})
+            `);
+            await rewardPointsOnPurchase(request, userNo, finalPrice);
+
+            await transaction.commit();
+            res.json({ status: 'success', message: 'تم شراء القسيمة بنجاح', serialKey: newSerial });
+
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشلت العملية', error: err.message });
+    }
+};
+
+// ... (بقية الدوال getMyCoupons و upgradeToPublic تبقى كما هي) ...
+// 3. عرض قسائمي وإدارتها
+exports.getMyCoupons = async (req, res) => {
+    const userNo = req.user.userNo;
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request().input('uid', userNo).query(`
+            SELECT UC.RowID, UC.SerialKey, UC.IsPublic, UC.PurchaseDate, UC.Status,
+                   B.BundleName, B.PublicFeeGP 
+            FROM AdrenalineWeb.dbo.Web_UserCoupons UC
+            JOIN AdrenalineWeb.dbo.Web_CouponShop B ON UC.BundleID = B.BundleID
+            WHERE UC.UserNo = @uid
+            ORDER BY UC.PurchaseDate DESC
+        `);
+        res.json({ status: 'success', coupons: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ' });
+    }
+};
+
+// 4. تبديل القسيمة من "خاصة" إلى "عامة"
+exports.upgradeToPublic = async (req, res) => {
+    const { serialKey } = req.body;
+    const userNo = req.user.userNo;
+
+    try {
+        const pool = await poolPromise;
+
+        // أ. جلب معلومات القسيمة
+        const couponRes = await pool.request()
+            .input('uid', userNo)
+            .input('key', serialKey)
+            .query(`
+                SELECT UC.IsPublic, UC.BundleID, B.PublicFeeGP 
+                FROM AdrenalineWeb.dbo.Web_UserCoupons UC
+                JOIN AdrenalineWeb.dbo.Web_CouponShop B ON UC.BundleID = B.BundleID
+                WHERE UC.SerialKey = @key AND UC.UserNo = @uid
+            `);
+        
+        const coupon = couponRes.recordset[0];
+        if (!coupon) return res.status(404).json({ message: 'القسيمة غير موجودة' });
+        if (coupon.IsPublic) return res.status(400).json({ message: 'القسيمة عامة بالفعل' });
+
+        // ب. التحقق من الرصيد
+        const fee = coupon.PublicFeeGP;
+        const userCheck = await pool.request().input('uid', userNo).query("SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid");
+        if (userCheck.recordset[0].CashMoney < fee) {
+            return res.status(400).json({ message: `لا تملك رصيداً كافياً لتحويل القسيمة. الرسوم: ${fee} GP` });
+        }
+
+        // ج. تنفيذ التحديث
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+        try {
+            const request = new sql.Request(transaction);
+
+            // 1. خصم الرسوم
+            await request.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - ${fee} WHERE UserNo = ${userNo}`);
+
+            // 2. تحديث جدول اللعبة (TargetUserNo = NULL)
+            await request.query(`UPDATE GameDB.dbo.T_ItemSerialKey SET TargetUserNo = NULL WHERE SerialKey = '${serialKey}'`);
+
+            // 3. تحديث جدول الموقع
+            await request.query(`UPDATE AdrenalineWeb.dbo.Web_UserCoupons SET IsPublic = 1 WHERE SerialKey = '${serialKey}'`);
+
+            await transaction.commit();
+            res.json({ status: 'success', message: 'تم تحويل القسيمة إلى عامة بنجاح!' });
+
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
+
+    } catch (err) {
+        res.status(500).json({ message: 'فشل التحديث' });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\couponController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\inventoryController.js vvvvvvvvvv
+const { poolPromise, sql } = require('../config/db');
+
+// 1. عرض المخزن (العناصر غير الأساسية فقط)
+exports.getMyInventory = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const userNo = req.user.userNo;
+
+        const result = await pool.request()
+            .input('uid', userNo)
+            .query(`
+                SELECT 
+                    UI.SerialNo,
+                    UI.ItemId,
+                    UI.Count,
+                    UI.SealVal,
+                    UI.Durability,
+                    UI.Status, -- 1 = In Inventory, 2 = Equipped
+                    UI.EndDate,
+                    I.ItemName,
+                    I.ItemType,
+                    I.ImageURL,
+                    
+                    -- حساب الأيام المتبقية للعرض
+                    CASE 
+                        WHEN UI.EndDate > GETDATE() THEN DATEDIFF(DAY, GETDATE(), UI.EndDate)
+                        ELSE 0 
+                    END AS DaysLeft,
+
+                    -- تحديد ما إذا كان منتهي الصلاحية
+                    CASE 
+                        WHEN UI.EndDate < GETDATE() THEN 1 
+                        ELSE 0 
+                    END AS IsExpired
+
+                FROM GameDB.dbo.T_UserItem UI
+                LEFT JOIN GameDB.dbo.T_ItemInfo I ON UI.ItemId = I.ItemId
+                WHERE UI.UserNo = @uid 
+                  AND UI.Status != 0      -- ليس محذوفاً
+                  AND UI.IsBaseItem = 0   -- 👈 شرط أساسي: إخفاء العناصر الأساسية
+                ORDER BY UI.EndDate DESC
+            `);
+
+        res.json({
+            status: 'success',
+            inventory: result.recordset
+        });
+
+    } catch (err) {
+        console.error('Inventory Error:', err);
+        res.status(500).json({ message: 'خطأ في جلب بيانات المخزن', error: err.message });
+    }
+};
+
+// 2. ختم السلاح (مع الدفع + إلغاء التجهيز الإجباري)
+exports.sealItem = async (req, res) => {
+    const { serialNo } = req.body;
+    const userNo = req.user.userNo;
+
+    try {
+        const pool = await poolPromise;
+
+        // أ. جلب تكلفة الختم من إعدادات الموقع
+        // ملاحظة: تأكد من وجود مفتاح 'SealCost' في جدول Web_Settings، أو سيستخدم 1000 كقيمة افتراضية
+        const settingsResult = await pool.request()
+            .query(`SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'SealCost'`);
+        
+        const sealCost = settingsResult.recordset.length > 0 
+            ? parseInt(settingsResult.recordset[0].ConfigValue) 
+            : 1000; 
+
+        // ب. التحقق من السلاح ورصيد اللاعب
+        const checkResult = await pool.request()
+            .input('serial', serialNo)
+            .input('uid', userNo)
+            .query(`
+                SELECT 
+                    UI.SealVal, 
+                    UI.IsBaseItem, 
+                    UI.Status,
+                    U.CashMoney AS CurrentGP 
+                FROM GameDB.dbo.T_UserItem UI
+                JOIN GameDB.dbo.T_User U ON UI.UserNo = U.UserNo
+                WHERE UI.SerialNo = @serial AND UI.UserNo = @uid
+            `);
+
+        const item = checkResult.recordset[0];
+
+        // التحققات المنطقية
+        if (!item) return res.status(404).json({ message: 'العنصر غير موجود أو لا تملكه' });
+        if (item.IsBaseItem) return res.status(400).json({ message: 'لا يمكن ختم العناصر الأساسية' });
+        if (item.SealVal !== 0) return res.status(400).json({ message: 'هذا السلاح مختوم بالفعل' });
+        
+        // التحقق من الرصيد
+        if (item.CurrentGP < sealCost) {
+            return res.status(400).json({ message: `رصيدك غير كافٍ. تكلفة الختم: ${sealCost} GP` });
+        }
+
+        // ج. تنفيذ العملية (Transaction) - لضمان سلامة البيانات
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const request = new sql.Request(transaction);
+
+            // 1. خصم تكلفة الختم من اللاعب
+            await request.query(`
+                UPDATE GameDB.dbo.T_User 
+                SET CashMoney = CashMoney - ${sealCost} 
+                WHERE UserNo = ${userNo}
+            `);
+
+            // 2. ختم السلاح + إعادته للمخزن (Status = 1) + تصفير خانة السلاح (WeaponSlotNo = 0)
+            // هذا يضمن أنه لو كان مجهزاً، سيتحول لحالة "غير مجهز" في خصائص العنصر نفسه
+            await request.query(`
+                UPDATE GameDB.dbo.T_UserItem 
+                SET SealVal = 1, 
+                    Status = 1, 
+                    WeaponSlotNo = 0 
+                WHERE SerialNo = ${serialNo}
+            `);
+
+            // 3. 👈 الخطوة الحاسمة: حذفه من جدول التجهيزات (T_CharacterEquip)
+            // هذا الجدول هو الذي يخبر السيرفر "ماذا يرتدي اللاعب الآن؟"
+            // إذا لم نحذف الصف من هنا، سيظل السلاح يظهر في يد اللاعب داخل اللعبة
+            await request.query(`
+                DELETE FROM GameDB.dbo.T_CharacterEquip 
+                WHERE ItemSerialNo = ${serialNo} AND UserNo = ${userNo}
+            `);
+
+            // اعتماد التغييرات
+            await transaction.commit();
+
+            res.json({ 
+                status: 'success', 
+                message: `تم ختم السلاح وإلغاء تجهيزه بنجاح. تم خصم ${sealCost} GP.`,
+                newBalance: item.CurrentGP - sealCost
+            });
+
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
+
+    } catch (err) {
+        console.error('Sealing Error:', err);
+        res.status(500).json({ message: 'فشلت عملية الختم', error: err.message });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\inventoryController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\loyaltyController.js vvvvvvvvvv
+const { poolPromise, sql } = require('../config/db');
+const { encodeReferralCode } = require('../utils/referralCodec'); // 👈 أضف هذا السطر ضروري جداً
+// 1. عرض إحصائياتي + رابط الدعوة + حالة المكافأة اليومية
+exports.getMyLoyaltyStats = async (req, res) => {
+    const userNo = req.user.userNo;
+    // يمكنك وضع هذا الرابط في ملف .env لاحقاً
+    const SITE_URL = process.env.SITE_URL || 'http://localhost:3000'; 
+
+    try {
+        const pool = await poolPromise;
+        
+        // جلب النقاط وعدد الدعوات
+        const result = await pool.request()
+            .input('uid', userNo)
+            .query(`
+                SELECT 
+                    A.LoyaltyPoints,
+                    (SELECT COUNT(*) FROM AuthDB.dbo.T_Account WHERE ReferredBy = A.UserNo AND IsEmailVerified = 1) AS InvitedCount
+                FROM AuthDB.dbo.T_Account A
+                WHERE A.UserNo = @uid
+            `);
+
+        const data = result.recordset[0];
+
+        // جلب الإعدادات وسجل الحضور اليومي
+        const settings = await pool.request()
+            .input('uid', userNo)
+            .query(`
+                SELECT ConfigKey, ConfigValue FROM AdrenalineWeb.dbo.Web_Settings 
+                WHERE ConfigKey IN ('Loyalty_ExchangeRate_Cash', 'Loyalty_ExchangeRate_GP', 'ReferralMaxCount', 'DailyLoginPoints');
+
+                SELECT LastClaimDate FROM AdrenalineWeb.dbo.Web_DailyAttendance WHERE UserNo = @uid;
+            `);
+        
+        const rates = {};
+        settings.recordsets[0].forEach(s => rates[s.ConfigKey] = s.ConfigValue);
+
+        // التحقق هل استلم المكافأة اليوم؟
+        let canClaimDaily = true;
+        const dailyRecord = settings.recordsets[1][0];
+        
+        if (dailyRecord) {
+            const lastDate = new Date(dailyRecord.LastClaimDate).toISOString().split('T')[0]; // YYYY-MM-DD
+            const today = new Date().toISOString().split('T')[0];
+            if (lastDate === today) canClaimDaily = false;
+        }
+
+        res.json({
+            status: 'success',
+            points: data.LoyaltyPoints,
+            invitedCount: data.InvitedCount,
+            maxInvites: parseInt(rates['ReferralMaxCount']) || 50,
+            dailyRewardPoints: parseInt(rates['DailyLoginPoints']) || 5,
+            
+            // 👈 رابط الدعوة الجاهز
+            referralCode: encodeReferralCode(userNo), 
+            referralLink: `${SITE_URL}/register?ref=${encodeReferralCode(userNo)}`,
+
+            canClaimDaily: canClaimDaily, // true = الزر مفعل، false = الزر معطل
+            
+            exchangeRates: {
+                cash: parseInt(rates['Loyalty_ExchangeRate_Cash']) || 1,
+                gp: parseInt(rates['Loyalty_ExchangeRate_GP']) || 1000
+            }
+        });
+
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب البيانات', error: err.message });
+    }
+};
+
+// 2. استلام المكافأة اليومية (Daily Check-in)
+exports.claimDailyReward = async (req, res) => {
+    const userNo = req.user.userNo;
+
+    try {
+        const pool = await poolPromise;
+
+        // التحقق مرة أخرى (Server Side Validation)
+        const check = await pool.request().input('uid', userNo).query(`SELECT LastClaimDate FROM AdrenalineWeb.dbo.Web_DailyAttendance WHERE UserNo = @uid`);
+        
+        if (check.recordset[0]) {
+            const lastDate = new Date(check.recordset[0].LastClaimDate).toISOString().split('T')[0];
+            const today = new Date().toISOString().split('T')[0];
+            if (lastDate === today) return res.status(400).json({ message: 'لقد استلمت المكافأة اليوم بالفعل' });
+        }
+
+        // جلب قيمة النقاط
+        const settingRes = await pool.request().query(`SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'DailyLoginPoints'`);
+        const points = settingRes.recordset[0] ? parseInt(settingRes.recordset[0].ConfigValue) : 5;
+
+        // تنفيذ العملية
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const request = new sql.Request(transaction);
+
+            // إضافة النقاط
+            await request.query(`UPDATE AuthDB.dbo.T_Account SET LoyaltyPoints = LoyaltyPoints + ${points} WHERE UserNo = ${userNo}`);
+
+            // تحديث سجل الحضور (Insert or Update)
+            await request.query(`
+                IF EXISTS (SELECT * FROM AdrenalineWeb.dbo.Web_DailyAttendance WHERE UserNo = ${userNo})
+                    UPDATE AdrenalineWeb.dbo.Web_DailyAttendance SET LastClaimDate = GETDATE(), Streak = Streak + 1 WHERE UserNo = ${userNo}
+                ELSE
+                    INSERT INTO AdrenalineWeb.dbo.Web_DailyAttendance (UserNo, LastClaimDate, Streak) VALUES (${userNo}, GETDATE(), 1)
+            `);
+
+            // تسجيل العملية
+            await request.query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_LoyaltyLog (UserNo, PointsSpent, RewardType, RewardAmount, Date)
+                VALUES (${userNo}, 0, 'DAILY_LOGIN', ${points}, GETDATE())
+            `);
+
+            await transaction.commit();
+            res.json({ status: 'success', message: `تم تسجيل الحضور! حصلت على ${points} نقاط`, pointsEarned: points });
+
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل العملية' });
+    }
+};
+
+// 3. تحويل النقاط (كما هي سابقاً)
+exports.exchangePoints = async (req, res) => {
+    const { pointsToSpend, type } = req.body; 
+    const userNo = req.user.userNo;
+
+    if (!pointsToSpend || pointsToSpend <= 0) return res.status(400).json({ message: 'العدد غير صحيح' });
+
+    try {
+        const pool = await poolPromise;
+        const check = await pool.request().input('uid', userNo).query(`
+            SELECT A.LoyaltyPoints, S.ConfigValue AS Rate
+            FROM AuthDB.dbo.T_Account A, AdrenalineWeb.dbo.Web_Settings S
+            WHERE A.UserNo = @uid AND S.ConfigKey = 'Loyalty_ExchangeRate_${type}'
+        `);
+
+        if (!check.recordset[0]) return res.status(400).json({ message: 'خطأ في البيانات' });
+        
+        const { LoyaltyPoints, Rate } = check.recordset[0];
+        if (LoyaltyPoints < pointsToSpend) return res.status(400).json({ message: 'نقاطك غير كافية' });
+
+        const rewardAmount = pointsToSpend * parseInt(Rate);
+        
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+        try {
+            const request = new sql.Request(transaction);
+            await request.query(`UPDATE AuthDB.dbo.T_Account SET LoyaltyPoints = LoyaltyPoints - ${pointsToSpend} WHERE UserNo = ${userNo}`);
+            
+            const col = type === 'CASH' ? 'CashMoney' : 'GameMoney';
+            await request.query(`UPDATE GameDB.dbo.T_User SET ${col} = ${col} + ${rewardAmount} WHERE UserNo = ${userNo}`);
+            
+            await request.query(`INSERT INTO AdrenalineWeb.dbo.Web_LoyaltyLog (UserNo, PointsSpent, RewardType, RewardAmount, Date) VALUES (${userNo}, ${pointsToSpend}, '${type}', ${rewardAmount}, GETDATE())`);
+            
+            await transaction.commit();
+            res.json({ status: 'success', message: 'تم التحويل بنجاح', newBalance: LoyaltyPoints - pointsToSpend });
+        } catch (e) {
+            await transaction.rollback();
+            throw e;
+        }
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في السيرفر' });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\loyaltyController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\newsController.js vvvvvvvvvv
+const { poolPromise } = require('../config/db');
+
+// 1. عرض كل الأخبار (متاح للجميع)
+exports.getAllNews = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        // نجلب الأخبار مرتبة من الأحدث للأقدم
+        const result = await pool.request().query(`
+            SELECT NewsID, Title, Content, Category, Author, CreateDate 
+            FROM AdrenalineWeb.dbo.Web_News 
+            ORDER BY CreateDate DESC
+        `);
+
+        res.json({ status: 'success', news: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب الأخبار', error: err.message });
+    }
+};
+
+// 2. إضافة خبر جديد (للأدمن فقط)
+exports.createNews = async (req, res) => {
+    const { title, content, category } = req.body;
+    // نستخدم اسم المستخدم من التوكن كاسم للكاتب
+    const author = req.user.userId || 'Admin'; 
+
+    if (!title || !content) {
+        return res.status(400).json({ message: 'العنوان والمحتوى مطلوبان' });
+    }
+
+    try {
+        const pool = await poolPromise;
+        
+        await pool.request()
+            .input('title', title)
+            .input('content', content)
+            .input('cat', category || 'General')
+            .input('auth', author)
+            .query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_News (Title, Content, Category, Author)
+                VALUES (@title, @content, @cat, @auth)
+            `);
+
+        res.json({ status: 'success', message: 'تم نشر الخبر بنجاح' });
+    } catch (err) {
+        res.status(500).json({ message: 'فشل نشر الخبر', error: err.message });
+    }
+};
+
+// 3. حذف خبر (للأدمن فقط)
+exports.deleteNews = async (req, res) => {
+    const { id } = req.params; // نأخذ الرقم من الرابط مباشرة
+
+    try {
+        const pool = await poolPromise;
+        await pool.request()
+            .input('id', id)
+            .query('DELETE FROM AdrenalineWeb.dbo.Web_News WHERE NewsID = @id');
+
+        res.json({ status: 'success', message: 'تم حذف الخبر' });
+    } catch (err) {
+        res.status(500).json({ message: 'فشل حذف الخبر', error: err.message });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\newsController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\rankController.js vvvvvvvvvv
+const { poolPromise } = require('../config/db');
+
+// 1. ترتيب اللاعبين (Top Players) - يعتمد على GameDB
+exports.getTopPlayers = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        
+        const result = await pool.request().query(`
+            SELECT TOP 10
+                U.Ranking,
+                U.Nickname,
+                U.Level,
+                U.Exp,
+                U.TotalKillCount,
+                U.TotalDeathCount,
+                -- جلب اسم الكلان إن وجد
+                (SELECT C.ClanName FROM ClanDB.dbo.T_Clan C WHERE C.ClanNo = U.ClanNo) AS ClanName
+            FROM GameDB.dbo.T_User U
+            WHERE U.IsAccountBlock = 0 
+              AND U.GMGrade = 0
+            ORDER BY U.Exp DESC
+        `);
+
+        res.json({ status: 'success', list: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب تصنيف اللاعبين', error: err.message });
+    }
+};
+
+// 2. ترتيب الهدافين (Top Killers) - يعتمد على GameDB
+exports.getTopKillers = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        
+        const result = await pool.request().query(`
+            SELECT TOP 10
+                U.Nickname,
+                U.Level,
+                U.TotalKillCount,
+                U.TotalDeathCount,
+                -- حساب الـ KD Ratio
+                CASE 
+                    WHEN U.TotalDeathCount = 0 THEN U.TotalKillCount 
+                    ELSE ROUND(CAST(U.TotalKillCount AS FLOAT) / U.TotalDeathCount, 2)
+                END AS KDRatio,
+                (SELECT C.ClanName FROM ClanDB.dbo.T_Clan C WHERE C.ClanNo = U.ClanNo) AS ClanName
+            FROM GameDB.dbo.T_User U
+            WHERE U.IsAccountBlock = 0 
+              AND U.GMGrade = 0
+            ORDER BY U.TotalKillCount DESC
+        `);
+
+        res.json({ status: 'success', list: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب الهدافين', error: err.message });
+    }
+};
+
+// 3. ترتيب الكلانات (Top Clans) - تم التعديل بناءً على ClanDB الجديد 🛠️
+exports.getTopClans = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        
+        // التعديلات:
+        // 1. استخدمنا C.CCBPoint بدلاً من C.Point
+        // 2. جلبنا اسم القائد من جدول Clan_MemberInfo
+        // 3. استبعدنا الكلانات المحذوفة (Status != 2)
+        const result = await pool.request().query(`
+            SELECT TOP 10
+                C.ClanName,
+                C.VolumeLevel AS ClanLevel, -- مستوى الكلان
+                C.CCBPoint AS ClanPoints,   -- النقاط (تم التصحيح)
+                C.CCBWinCount,
+                C.CCBLoseCount,
+                -- حساب عدد الأعضاء
+                (SELECT COUNT(*) FROM ClanDB.dbo.T_ClanMember CM WHERE CM.ClanNo = C.ClanNo) AS MemberCount,
+                -- جلب اسم القائد
+                (SELECT M.Nickname FROM ClanDB.dbo.Clan_MemberInfo M WHERE M.UserNo = C.MasterUserNo) AS MasterName
+            FROM ClanDB.dbo.T_Clan C
+            WHERE C.Status != 2 -- لا نعرض الكلانات المحذوفة
+            ORDER BY C.CCBPoint DESC
+        `);
+
+        res.json({ status: 'success', list: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب الكلانات', error: err.message });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\rankController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\settingsController.js vvvvvvvvvv
+const { poolPromise } = require('../config/db');
+
+// 1. جلب الإعدادات العامة (متاح للجميع - للزوار والموقع)
+exports.getPublicSettings = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request().query('SELECT ConfigKey, ConfigValue FROM AdrenalineWeb.dbo.Web_Settings');
+
+        // تحويل المصفوفة إلى كائن JSON بسيط
+        // النتيجة ستكون مثل: { "ServerStatus": "Online", "DownloadLink": "..." }
+        const settings = {};
+        result.recordset.forEach(row => {
+            settings[row.ConfigKey] = row.ConfigValue;
+        });
+
+        res.json({ status: 'success', settings: settings });
+
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب الإعدادات', error: err.message });
+    }
+};
+
+// 2. تحديث إعداد معين (للأدمن فقط)
+exports.updateSetting = async (req, res) => {
+    const { key, value } = req.body;
+
+    if (!key || value === undefined) {
+        return res.status(400).json({ message: 'يجب إرسال اسم الإعداد وقيمته الجديدة' });
+    }
+
+    try {
+        const pool = await poolPromise;
+        
+        // التحقق هل الإعداد موجود أصلاً؟
+        const check = await pool.request()
+            .input('k', key)
+            .query('SELECT ConfigKey FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = @k');
+
+        if (check.recordset.length === 0) {
+            return res.status(404).json({ message: 'هذا الإعداد غير موجود في النظام' });
+        }
+
+        // التحديث
+        await pool.request()
+            .input('val', value)
+            .input('k', key)
+            .query('UPDATE AdrenalineWeb.dbo.Web_Settings SET ConfigValue = @val WHERE ConfigKey = @k');
+
+        res.json({ status: 'success', message: `تم تحديث ${key} بنجاح` });
+
+    } catch (err) {
+        res.status(500).json({ message: 'فشل تحديث الإعدادات', error: err.message });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\settingsController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\shopController.js vvvvvvvvvv
+const { poolPromise, sql } = require('../config/db');
+
+// 1. عرض عناصر المتجر (لم يتغير)
+exports.getShopItems = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request()
+            .query(`
+                SELECT ShopID, ItemName, PriceGP, Duration, Count, Category, ImageURL 
+                FROM AdrenalineWeb.dbo.Web_Shop 
+                WHERE IsActive = 1
+            `);
+
+        res.json({ status: 'success', items: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب المتجر', error: err.message });
+    }
+};
+
+// 2. شراء عنصر (الكود الجديد بناءً على sp_BuyItem)
+exports.buyItem = async (req, res) => {
+    const { shopId } = req.body;
+    const userNo = req.user.userNo;
+
+    try {
+        const pool = await poolPromise;
+
+        // أ. الخطوة الأولى: دمج معلومات المتجر (للسعر) مع معلومات اللعبة (للمواصفات التقنية)
+        // هذا الاستعلام "الذكي" يجلب كل ما نحتاجه في ضربة واحدة
+        const itemQuery = await pool.request()
+            .input('sid', shopId)
+            .query(`
+                SELECT 
+                    -- بيانات من المتجر (السعر والمدة)
+                    W.PriceGP, 
+                    W.Duration, 
+                    W.ItemID, 
+                    W.Count, 
+                    W.ItemName,
+                    
+                    -- بيانات تقنية حساسة من ملفات اللعبة (T_ItemInfo)
+                    I.ItemType,
+                    I.IsBaseItem,
+                    I.IsGrenade,
+                    I.NeedSlot,
+                    I.RestrictLevel,
+                    I.UseType,
+                    I.IsPcBangItem
+                FROM AdrenalineWeb.dbo.Web_Shop W
+                JOIN GameDB.dbo.T_ItemInfo I ON W.ItemID = I.ItemId
+                WHERE W.ShopID = @sid AND W.IsActive = 1
+            `);
+
+        const shopItem = itemQuery.recordset[0];
+
+        // التحقق من وجود العنصر
+        if (!shopItem) {
+            return res.status(404).json({ message: 'العنصر غير موجود أو خطأ في تعريف T_ItemInfo' });
+        }
+
+        // ب. التحقق من رصيد اللاعب
+        const userCheck = await pool.request()
+            .input('uid', userNo)
+            .query('SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid');
+            
+        const currentGP = userCheck.recordset[0].CashMoney;
+
+        if (currentGP < shopItem.PriceGP) {
+            return res.status(400).json({ 
+                message: `رصيدك غير كافٍ. تحتاج ${shopItem.PriceGP} GP وأنت تملك ${currentGP} GP` 
+            });
+        }
+
+        // ج. تنفيذ العملية (Transaction)
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const request = new sql.Request(transaction);
+
+            // 1. خصم الرصيد
+            await request.query(`
+                UPDATE GameDB.dbo.T_User 
+                SET CashMoney = CashMoney - ${shopItem.PriceGP} 
+                WHERE UserNo = ${userNo}
+            `);
+
+            // 2. إضافة السلاح بدقة عالية (مطابقة لـ sp_BuyItem)
+            // نستخدم ISNULL لضمان عدم حدوث خطأ إذا كانت بعض القيم فارغة في الداتابيز
+            const insertQuery = `
+                INSERT INTO GameDB.dbo.T_UserItem 
+                (
+                    UserNo, ItemId, ItemType, IsBaseItem, Count, Status, 
+                    StartDate, EndDate, IsGrenade, NeedSlot, IsPcBangItem, 
+                    RestrictLevel, UseType, SealVal
+                )
+                VALUES 
+                (
+                    ${userNo}, 
+                    ${shopItem.ItemID}, 
+                    ${shopItem.ItemType || 0},      -- ItemType من اللعبة
+                    ${shopItem.IsBaseItem ? 1 : 0}, -- هل هو أساسي؟
+                    ${shopItem.Count}, 
+                    1,                              -- Status: 1 (موجود في الحقيبة غير مجهز)
+                    GETDATE(), 
+                    DATEADD(DAY, ${shopItem.Duration}, GETDATE()), -- تاريخ الانتهاء
+                    ${shopItem.IsGrenade ? 1 : 0},  -- هل هو قنبلة؟
+                    ${shopItem.NeedSlot || 0},      -- هل يحتاج خانة؟
+                    ${shopItem.IsPcBangItem ? 1 : 0}, 
+                    ${shopItem.RestrictLevel || 0}, -- اللفل المطلوب
+                    ${shopItem.UseType || 0},       -- نوع الاستخدام
+                    0                               -- SealVal: 0 (جاهز للاستخدام فوراً)
+                )
+            `;
+            
+            await request.query(insertQuery);
+
+            await transaction.commit(); // اعتماد العملية
+
+            res.json({
+                status: 'success',
+                message: `تم شراء ${shopItem.ItemName} بنجاح!`,
+                newBalance: currentGP - shopItem.PriceGP
+            });
+
+        } catch (err) {
+            await transaction.rollback(); // إلغاء كل شيء في حال الخطأ
+            throw err;
+        }
+
+    } catch (err) {
+        console.error('Shop Purchase Error:', err);
+        res.status(500).json({ message: 'فشلت عملية الشراء', error: err.message });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\shopController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: controllers\userController.js vvvvvvvvvv
+const { poolPromise, sql } = require('../config/db');
+
+// 1. جلب بيانات البروفايل
+exports.getProfile = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const userNo = req.user.userNo; 
+
+        const result = await pool.request()
+            .input('id', userNo)
+            .query(`
+                SELECT 
+                    U.Nickname,
+                    U.Level,
+                    U.Exp,
+                    U.GameMoney AS Money,
+                    U.CashMoney AS GP,
+                    U.TotalWinCount,
+                    U.TotalLoseCount,
+                    U.TotalKillCount,
+                    U.TotalDeathCount,
+                    U.RegDate,
+                    (SELECT TOP 1 C.ClanName FROM ClanDB.dbo.T_Clan C WHERE C.ClanNo = U.ClanNo) AS ClanName
+                FROM GameDB.dbo.T_User U
+                WHERE U.UserNo = @id
+            `);
+
+        if (result.recordset.length === 0) {
+            return res.status(404).json({ message: 'بيانات اللاعب غير موجودة' });
+        }
+
+        const playerData = result.recordset[0];
+
+        const kdRatio = playerData.TotalDeathCount === 0 
+            ? playerData.TotalKillCount 
+            : (playerData.TotalKillCount / playerData.TotalDeathCount).toFixed(2);
+
+        res.json({
+            status: 'success',
+            player: {
+                ...playerData,
+                kdRatio: kdRatio
+            }
+        });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'خطأ في جلب البيانات' });
+    }
+};
+
+// 2. تغيير كلمة المرور
+exports.changePassword = async (req, res) => {
+    const { oldPassword, newPassword } = req.body;
+    const userNo = req.user.userNo;
+
+    if (!oldPassword || !newPassword) {
+        return res.status(400).json({ message: 'يجب إدخال كلمة المرور القديمة والجديدة' });
+    }
+
+    if (newPassword.length < 4) {
+        return res.status(400).json({ message: 'كلمة المرور الجديدة قصيرة جداً' });
+    }
+
+    try {
+        const pool = await poolPromise;
+
+        const checkPass = await pool.request()
+            .input('uid', userNo)
+            .query('SELECT Password FROM AuthDB.dbo.T_Account WHERE UserNo = @uid');
+
+        const currentAccount = checkPass.recordset[0];
+
+        if (!currentAccount) {
+            return res.status(404).json({ message: 'الحساب غير موجود' });
+        }
+
+        if (currentAccount.Password !== oldPassword) {
+            return res.status(400).json({ message: 'كلمة المرور القديمة غير صحيحة' });
+        }
+
+        await pool.request()
+            .input('uid', userNo)
+            .input('newPass', newPassword)
+            .query('UPDATE AuthDB.dbo.T_Account SET Password = @newPass WHERE UserNo = @uid');
+
+        res.json({ status: 'success', message: 'تم تغيير كلمة المرور بنجاح' });
+
+    } catch (err) {
+        console.error('Password Change Error:', err);
+        res.status(500).json({ message: 'فشل تغيير كلمة المرور', error: err.message });
+    }
+};
+
+// 3. عرض حالة الحظر (جديد)
+exports.getBanStatus = async (req, res) => {
+    const userNo = req.user.userNo;
+
+    try {
+        const pool = await poolPromise;
+        
+        const banInfo = await pool.request()
+            .input('uid', userNo)
+            .query(`
+                SELECT TOP 1 Reason, BanDate, BannedBy 
+                FROM AdrenalineWeb.dbo.Web_BanLog 
+                WHERE UserNo = @uid AND IsActive = 1 
+                ORDER BY BanID DESC
+            `);
+
+        const requestInfo = await pool.request()
+            .input('uid', userNo)
+            .query(`
+                SELECT TOP 1 Status, FineAmount, RequestDate 
+                FROM AdrenalineWeb.dbo.Web_UnbanRequests 
+                WHERE UserNo = @uid 
+                ORDER BY RequestID DESC
+            `);
+
+        res.json({
+            status: 'success',
+            isBanned: req.user.isBanned,
+            banDetails: banInfo.recordset[0] || null,
+            lastRequest: requestInfo.recordset[0] || null
+        });
+
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب المعلومات' });
+    }
+};
+
+// 4. طلب فك الحظر (جديد)
+exports.requestUnban = async (req, res) => {
+    const userNo = req.user.userNo;
+    const settingsRes = await pool.request()
+    .query("SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'UnbanFine'");
+
+    try {
+        const pool = await poolPromise;
+
+        const checkPending = await pool.request()
+            .input('uid', userNo)
+            .query("SELECT * FROM AdrenalineWeb.dbo.Web_UnbanRequests WHERE UserNo = @uid AND Status = 'Pending'");
+
+        if (checkPending.recordset.length > 0) {
+            return res.status(400).json({ message: 'لديك طلب قيد المراجعة بالفعل، يرجى الانتظار' });
+        }
+
+        await pool.request()
+            .input('uid', userNo)
+            .input('fine', fineAmount)
+            .query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_UnbanRequests (UserNo, FineAmount, Status)
+                VALUES (@uid, @fine, 'Pending')
+            `);
+
+        res.json({ status: 'success', message: 'تم إرسال طلب فك الحظر. سيقوم الأدمن بمراجعته وخصم الغرامة.' });
+
+    } catch (err) {
+        res.status(500).json({ message: 'فشل إرسال الطلب', error: err.message });
+    }
+};
+^^^^^^^^^^ FILE END: controllers\userController.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: middleware\adminMiddleware.js vvvvvvvvvv
+module.exports = (req, res, next) => {
+    // 1. هذا الميدلوير يعمل بعد authMiddleware، لذا نفترض وجود req.user
+    // 2. نتحقق هل المستخدم أدمن؟ (isAdmin التي وضعناها في التوكن عند تسجيل الدخول)
+    
+    if (!req.user || !req.user.isAdmin) {
+        return res.status(403).json({ message: 'غير مصرح لك (هذه الميزة للمشرفين فقط)' });
+    }
+
+    next(); // اسمح له بالمرور
+};
+^^^^^^^^^^ FILE END: middleware\adminMiddleware.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: middleware\authMiddleware.js vvvvvvvvvv
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_adrenaline_key_2026';
+
+module.exports = (req, res, next) => {
+    // 1. البحث عن التوكن في "ترويسة" الطلب (Header)
+    const token = req.header('x-auth-token');
+
+    // 2. إذا لم يرسل التوكن، نرفض الطلب
+    if (!token) {
+        return res.status(401).json({ message: 'لا يوجد إذن دخول، التوكن مفقود' });
+    }
+
+    try {
+        // 3. فك تشفير التوكن للتأكد من صحته
+        const decoded = jwt.verify(token, JWT_SECRET);
+        
+        // 4. حفظ بيانات المستخدم في الطلب لنستخدمها لاحقاً
+        req.user = decoded;
+        
+        next(); // اسمح له بالمرور للكود التالي
+    } catch (err) {
+        res.status(401).json({ message: 'التوكن غير صالح أو منتهي الصلاحية' });
+    }
+};
+^^^^^^^^^^ FILE END: middleware\authMiddleware.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: package.json vvvvvvvvvv
+{
+  "name": "ad-sile",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.10.1",
+    "mssql": "^12.2.0",
+    "nodemailer": "^7.0.12",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
+
+^^^^^^^^^^ FILE END: package.json ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\adminRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const adminController = require('../controllers/adminController');
+const auth = require('../middleware/authMiddleware');
+const admin = require('../middleware/adminMiddleware');
+
+// جميع الروابط تتطلب: توكن + صلاحية أدمن
+router.post('/ban', auth, admin, adminController.banPlayer);
+router.get('/unban-requests', auth, admin, adminController.getUnbanRequests);
+router.post('/approve-unban', auth, admin, adminController.approveUnban);
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\adminRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\authRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const authController = require('../controllers/authController');
+
+// 1. تسجيل الدخول
+router.post('/login', authController.login);
+
+// 2. تسجيل جديد (ينشئ حساب فقط)
+router.post('/register', authController.register);
+
+// 3. تفعيل الإيميل (رابط GET يفتح في المتصفح)
+router.get('/verify-email', authController.verifyEmail);
+// ... الروابط السابقة (login, register, verify-email)
+
+// 4. طلب الاستعادة (يرسل الإيميل)
+router.post('/forgot-password', authController.forgotPassword);
+
+// 5. تنفيذ التغيير (يستقبل التوكن والباسورد الجديد)
+router.post('/reset-password', authController.resetPassword);
+router.post('/resend-verification', authController.resendVerification); // زر "إعادة الإرسال"
+router.post('/change-pending-email', authController.changePendingEmail); // زر "تصحيح الإيميل"
+router.post('/forgot-password', authController.forgotPassword);
+
+// 2. الصفحة التي تظهر عند الضغط على الرابط في الإيميل (GET) 🆕
+router.get('/reset-password-page', authController.getResetPasswordPage);
+
+// 3. استقبال الباسورد الجديد (POST)
+router.post('/reset-password', authController.resetPassword);
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\authRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\couponAdminRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const couponAdminController = require('../controllers/couponAdminController');
+const auth = require('../middleware/authMiddleware');
+const admin = require('../middleware/adminMiddleware');
+
+// جميع الروابط تتطلب أن تكون أدمن
+router.post('/create-bundle', auth, admin, couponAdminController.createBundle);
+router.post('/create-gift', auth, admin, couponAdminController.createGiftCoupon);
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\couponAdminRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\couponRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const couponController = require('../controllers/couponController');
+const auth = require('../middleware/authMiddleware');
+
+// 1. عرض متجر الحزم (متاح للمسجلين)
+router.get('/shop', auth, couponController.getShopBundles);
+
+// 2. شراء حزمة (توليد كود)
+router.post('/buy', auth, couponController.buyBundle);
+
+// 3. عرض قسائمي
+router.get('/my-coupons', auth, couponController.getMyCoupons);
+
+// 4. ترقية القسيمة لعامة
+router.post('/upgrade', auth, couponController.upgradeToPublic);
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\couponRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\inventoryRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const inventoryController = require('../controllers/inventoryController');
+const auth = require('../middleware/authMiddleware');
+
+router.get('/my-items', auth, inventoryController.getMyInventory);
+router.post('/seal', auth, inventoryController.sealItem);
+// تم حذف unseal حسب طلبك
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\inventoryRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\loyaltyRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const loyaltyController = require('../controllers/loyaltyController');
+const auth = require('../middleware/authMiddleware');
+
+router.get('/my-stats', auth, loyaltyController.getMyLoyaltyStats);
+router.post('/exchange', auth, loyaltyController.exchangePoints);
+router.post('/daily-claim', auth, loyaltyController.claimDailyReward); // 👈 الرابط الجديد
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\loyaltyRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\newsRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const newsController = require('../controllers/newsController');
+const auth = require('../middleware/authMiddleware');
+const admin = require('../middleware/adminMiddleware'); // استيراد حماية الأدمن
+
+// 1. عرض الأخبار (متاح للجميع - لا يحتاج توكن)
+router.get('/list', newsController.getAllNews);
+
+// 2. إضافة خبر (يحتاج توكن + صلاحية أدمن)
+// الترتيب مهم: تحقق من التوكن أولاً (auth)، ثم تحقق من الصلاحية (admin)
+router.post('/add', auth, admin, newsController.createNews);
+
+// 3. حذف خبر (يحتاج توكن + صلاحية أدمن)
+router.delete('/delete/:id', auth, admin, newsController.deleteNews);
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\newsRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\rankRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const rankController = require('../controllers/rankController');
+
+// هذه الروابط عامة (لا تحتاج توكن auth) لأن أي شخص زائر يمكنه رؤية الترتيب
+router.get('/players', rankController.getTopPlayers);
+router.get('/killers', rankController.getTopKillers);
+router.get('/clans', rankController.getTopClans);
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\rankRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\settingsRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const settingsController = require('../controllers/settingsController');
+const auth = require('../middleware/authMiddleware');
+const admin = require('../middleware/adminMiddleware');
+
+// 1. جلب الإعدادات (مفتوح للجميع - لا يحتاج توكن)
+// لأن الزائر يحتاج معرفة رابط التحميل قبل تسجيل الدخول
+router.get('/public', settingsController.getPublicSettings);
+
+// 2. تحديث الإعدادات (للأدمن فقط)
+router.post('/update', auth, admin, settingsController.updateSetting);
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\settingsRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\shopRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const shopController = require('../controllers/shopController');
+const auth = require('../middleware/authMiddleware');
+
+// عرض المتجر (متاح للجميع أو للأعضاء فقط، هنا جعلته للأعضاء)
+router.get('/list', auth, shopController.getShopItems);
+
+// الشراء (يتطلب توكن)
+router.post('/buy', auth, shopController.buyItem);
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\shopRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: routes\userRoutes.js vvvvvvvvvv
+const express = require('express');
+const router = express.Router();
+const userController = require('../controllers/userController');
+const auth = require('../middleware/authMiddleware');
+
+// الروابط الأساسية
+router.get('/profile', auth, userController.getProfile);
+router.post('/change-password', auth, userController.changePassword);
+
+// روابط الحظر (تأكد أنك نسخت الكود أعلاه لكي تعمل هذه الدوال)
+router.get('/ban-info', auth, userController.getBanStatus);
+router.post('/request-unban', auth, userController.requestUnban);
+
+module.exports = router;
+^^^^^^^^^^ FILE END: routes\userRoutes.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: server.js vvvvvvvvvv
+const express = require('express');
+const cors = require('cors');
+const morgan = require('morgan');
+require('dotenv').config();
+const { poolPromise } = require('./config/db'); // استيراد ملف الاتصال
+const authRoutes = require('./routes/authRoutes');
+const userRoutes = require('./routes/userRoutes'); // 👈 أضف هذا
+const inventoryRoutes = require('./routes/inventoryRoutes');
+const shopRoutes = require('./routes/shopRoutes'); // 👈 1. استيراد الملف
+const rankRoutes = require('./routes/rankRoutes'); // 👈
+const newsRoutes = require('./routes/newsRoutes'); // 👈
+const adminRoutes = require('./routes/adminRoutes'); // 👈 1. أضف هذا السطر
+const settingsRoutes = require('./routes/settingsRoutes'); // 👈
+const couponRoutes = require('./routes/couponRoutes');
+const couponAdminRoutes = require('./routes/couponAdminRoutes');
+const loyaltyRoutes = require('./routes/loyaltyRoutes');
+const app = express();
+
+// أدوات مساعدة (Middleware)
+app.use(cors()); // للسماح للموقع بالاتصال بالـ API
+app.use(express.json()); // لفهم البيانات بصيغة JSON
+app.use(morgan('dev')); // لتسجيل الطلبات في التيرمينال
+app.use('/api/auth', authRoutes);
+app.use('/api/user', userRoutes); // 👈 أضف هذا
+app.use('/api/inventory', inventoryRoutes);
+app.use('/api/shop', shopRoutes); // 👈 2. تفعيل الرابط
+app.use('/api/rank', rankRoutes); // 👈
+app.use('/api/news', newsRoutes); // 👈
+app.use('/api/admin', adminRoutes); // 👈 2. أضف هذا السطر ضروري جداً
+app.use('/api/settings', settingsRoutes); // 👈
+app.use('/api/coupon', couponRoutes);           // روابط اللاعبين
+app.use('/api/admin/coupon', couponAdminRoutes); // روابط الأدمن
+app.use('/api/loyalty', loyaltyRoutes);
+// === رابط تجريبي (Test Route) ===
+// هذا الرابط سيفحص الاتصال ويجلب الأخبار من جدول Web_News
+app.get('/', async (req, res) => {
+    try {
+        // 1. الحصول على الاتصال
+        const pool = await poolPromise;
+        
+        // 2. تنفيذ استعلام بسيط
+        const result = await pool.request().query('SELECT * FROM Web_News');
+        
+        // 3. إرسال النتيجة
+        res.json({
+            status: 'success',
+            message: 'API is Online & Connected to SQL!',
+            news_data: result.recordset
+        });
+    } catch (err) {
+        // في حال وجود خطأ
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// تشغيل السيرفر
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+});
+^^^^^^^^^^ FILE END: server.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: utils\referralCodec.js vvvvvvvvvv
+// إزاحة الرقم لكي لا يبدو كود أول لاعب "1" بل رقم أكبر يبدو عشوائياً
+const OFFSET = 14205; 
+const PREFIX = 'ADR'; // بادئة الكود (يمكنك تغييرها لاسم لعبتك مثلا ADR)
+
+/**
+ * تحويل رقم اللاعب إلى كود دعوة أنيق
+ * مثال: 1050 -> ADR37X
+ */
+function encodeReferralCode(userNo) {
+    if (!userNo) return null;
+    // نستخدم Base36 لتحويل الأرقام إلى حروف وأرقام (0-9, A-Z)
+    const code = (userNo + OFFSET).toString(36).toUpperCase();
+    return `${PREFIX}${code}`;
+}
+
+/**
+ * تحويل كود الدعوة مرة أخرى لرقم اللاعب لتخزينه
+ * مثال: ADR37X -> 1050
+ */
+function decodeReferralCode(code) {
+    if (!code || !code.startsWith(PREFIX)) return null;
+    
+    // إزالة البادئة
+    const cleanCode = code.replace(PREFIX, '');
+    
+    // التحويل العكسي من Base36 إلى رقم
+    const num = parseInt(cleanCode, 36);
+    
+    // إزالة الإزاحة لنحصل على UserNo الحقيقي
+    const userNo = num - OFFSET;
+    
+    return (userNo > 0) ? userNo : null;
+}
+
+module.exports = { encodeReferralCode, decodeReferralCode };
+^^^^^^^^^^ FILE END: utils\referralCodec.js ^^^^^^^^^^
+
+vvvvvvvvvv FILE START: utils\rewardSystem.js vvvvvvvvvv
+const { sql } = require('../config/db');
+
+/**
+ * دالة لحساب ومنح نقاط الولاء عند الشراء
+ * @param {object} request - كائن الطلب الخاص بالـ Transaction الحالية
+ * @param {number} userNo - رقم اللاعب
+ * @param {number} amountSpentGP - المبلغ الذي صرفه اللاعب
+ */
+async function rewardPointsOnPurchase(request, userNo, amountSpentGP) {
+    try {
+        // 1. جلب النسبة من الإعدادات (مثلاً 0.05 تعني 5%)
+        // نستخدم request الممرر إلينا لنكون داخل نفس الـ Transaction
+        const settingRes = await request.query(`SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'PurchasePointsRatio'`);
+        const ratio = settingRes.recordset[0] ? parseFloat(settingRes.recordset[0].ConfigValue) : 0;
+
+        // إذا كانت النسبة 0 أو غير موجودة، نوقف الدالة
+        if (ratio <= 0) return; 
+
+        // 2. حساب النقاط (تقريب للأدنى)
+        const pointsEarned = Math.floor(amountSpentGP * ratio);
+
+        if (pointsEarned > 0) {
+            // 3. إضافة النقاط لرصيد اللاعب
+            await request.query(`UPDATE AuthDB.dbo.T_Account SET LoyaltyPoints = LoyaltyPoints + ${pointsEarned} WHERE UserNo = ${userNo}`);
+            
+            // 4. تسجيل العملية في اللوج ليعرف اللاعب من أين جاءت النقاط
+            await request.query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_LoyaltyLog (UserNo, PointsSpent, RewardType, RewardAmount, Date)
+                VALUES (${userNo}, 0, 'PURCHASE_REWARD', ${pointsEarned}, GETDATE())
+            `);
+            
+            console.log(`[Reward System] User ${userNo} earned ${pointsEarned} points.`);
+        }
+    } catch (err) {
+        console.error('Reward System Error:', err);
+        // ملاحظة: لا نرمي الخطأ (throw) هنا لكي لا نوقف عملية الشراء الأصلية
+        // إذا فشل منح النقاط، اللاعب يحصل على غرضه عادي، والنقاط فقط هي التي تفشل
+    }
+}
+
+module.exports = { rewardPointsOnPurchase };
+^^^^^^^^^^ FILE END: utils\rewardSystem.js ^^^^^^^^^^
