@@ -25,27 +25,24 @@ exports.buyItem = async (req, res) => {
     try {
         const pool = await poolPromise;
 
-        // أ. الخطوة الأولى: دمج معلومات المتجر (للسعر) مع معلومات اللعبة (للمواصفات التقنية)
-        // هذا الاستعلام "الذكي" يجلب كل ما نحتاجه في ضربة واحدة
+        // 🛡️ أمان 1: فحص سعة الحقيبة قبل البدء (لتجنب ضياع السلاح أو تعليق اللعبة)
+        const inventoryCheck = await pool.request()
+            .input('uid', sql.Int, userNo)
+            .query('SELECT COUNT(*) as cnt FROM GameDB.dbo.T_UserItem WHERE UserNo = @uid');
+        
+        // الرقم 240 هو الحد الأقصى الشائع، يمكنك تعديله حسب إعدادات اللعبة
+        if (inventoryCheck.recordset[0].cnt >= 240) {
+            return res.status(400).json({ message: 'الحقيبة ممتلئة! يرجى حذف بعض العناصر أولاً.' });
+        }
+
+        // أ. الخطوة الأولى: دمج معلومات المتجر واللعبة (نفس الاستعلام الأصلي)
         const itemQuery = await pool.request()
-            .input('sid', shopId)
+            .input('sid', sql.Int, shopId) // 🛡️ استخدام input
             .query(`
                 SELECT 
-                    -- بيانات من المتجر (السعر والمدة)
-                    W.PriceGP, 
-                    W.Duration, 
-                    W.ItemID, 
-                    W.Count, 
-                    W.ItemName,
-                    
-                    -- بيانات تقنية حساسة من ملفات اللعبة (T_ItemInfo)
-                    I.ItemType,
-                    I.IsBaseItem,
-                    I.IsGrenade,
-                    I.NeedSlot,
-                    I.RestrictLevel,
-                    I.UseType,
-                    I.IsPcBangItem
+                    W.PriceGP, W.Duration, W.ItemID, W.Count, W.ItemName,
+                    I.ItemType, I.IsBaseItem, I.IsGrenade, I.NeedSlot, 
+                    I.RestrictLevel, I.UseType, I.IsPcBangItem
                 FROM AdrenalineWeb.dbo.Web_Shop W
                 JOIN GameDB.dbo.T_ItemInfo I ON W.ItemID = I.ItemId
                 WHERE W.ShopID = @sid AND W.IsActive = 1
@@ -53,14 +50,13 @@ exports.buyItem = async (req, res) => {
 
         const shopItem = itemQuery.recordset[0];
 
-        // التحقق من وجود العنصر
         if (!shopItem) {
             return res.status(404).json({ message: 'العنصر غير موجود أو خطأ في تعريف T_ItemInfo' });
         }
 
-        // ب. التحقق من رصيد اللاعب
+        // ب. التحقق المبدئي من الرصيد (للعرض فقط - الأمان الحقيقي في الـ Transaction)
         const userCheck = await pool.request()
-            .input('uid', userNo)
+            .input('uid', sql.Int, userNo)
             .query('SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid');
             
         const currentGP = userCheck.recordset[0].CashMoney;
@@ -78,15 +74,36 @@ exports.buyItem = async (req, res) => {
         try {
             const request = new sql.Request(transaction);
 
-            // 1. خصم الرصيد
-            await request.query(`
+            // 🛡️ أمان 2: تعريف جميع المتغيرات كـ Parameters لمنع الحقن (SQL Injection)
+            request.input('uid', sql.Int, userNo);
+            request.input('price', sql.Int, shopItem.PriceGP);
+            
+            // متغيرات الإدخال (نضمن القيم الافتراضية هنا أيضاً)
+            request.input('itemId', sql.Int, shopItem.ItemID);
+            request.input('type', sql.Int, shopItem.ItemType || 0);
+            request.input('base', sql.TinyInt, shopItem.IsBaseItem ? 1 : 0);
+            request.input('count', sql.Int, shopItem.Count);
+            request.input('days', sql.Int, shopItem.Duration);
+            request.input('grenade', sql.TinyInt, shopItem.IsGrenade ? 1 : 0);
+            request.input('slot', sql.Int, shopItem.NeedSlot || 0);
+            request.input('pcbang', sql.TinyInt, shopItem.IsPcBangItem ? 1 : 0);
+            request.input('level', sql.Int, shopItem.RestrictLevel || 0);
+            request.input('usetype', sql.Int, shopItem.UseType || 0);
+
+            // 1. خصم الرصيد (Atomic Update 🛡️)
+            // أضفنا شرط AND CashMoney >= @price لمنع Race Condition
+            const deductResult = await request.query(`
                 UPDATE GameDB.dbo.T_User 
-                SET CashMoney = CashMoney - ${shopItem.PriceGP} 
-                WHERE UserNo = ${userNo}
+                SET CashMoney = CashMoney - @price 
+                WHERE UserNo = @uid AND CashMoney >= @price
             `);
 
-            // 2. إضافة السلاح بدقة عالية (مطابقة لـ sp_BuyItem)
-            // نستخدم ISNULL لضمان عدم حدوث خطأ إذا كانت بعض القيم فارغة في الداتابيز
+            // إذا لم يتم تحديث أي صف، فهذا يعني أن الرصيد تغير فجأة (أقل من المطلوب)
+            if (deductResult.rowsAffected[0] === 0) {
+                throw new Error('فشلت العملية: الرصيد غير كافٍ (قد يكون تم استخدامه في جلسة أخرى)');
+            }
+
+            // 2. إضافة السلاح (باستخدام @parameters بدلاً من ${})
             const insertQuery = `
                 INSERT INTO GameDB.dbo.T_UserItem 
                 (
@@ -96,26 +113,26 @@ exports.buyItem = async (req, res) => {
                 )
                 VALUES 
                 (
-                    ${userNo}, 
-                    ${shopItem.ItemID}, 
-                    ${shopItem.ItemType || 0},      -- ItemType من اللعبة
-                    ${shopItem.IsBaseItem ? 1 : 0}, -- هل هو أساسي؟
-                    ${shopItem.Count}, 
-                    1,                              -- Status: 1 (موجود في الحقيبة غير مجهز)
+                    @uid, 
+                    @itemId, 
+                    @type, 
+                    @base, 
+                    @count, 
+                    1, 
                     GETDATE(), 
-                    DATEADD(DAY, ${shopItem.Duration}, GETDATE()), -- تاريخ الانتهاء
-                    ${shopItem.IsGrenade ? 1 : 0},  -- هل هو قنبلة؟
-                    ${shopItem.NeedSlot || 0},      -- هل يحتاج خانة؟
-                    ${shopItem.IsPcBangItem ? 1 : 0}, 
-                    ${shopItem.RestrictLevel || 0}, -- اللفل المطلوب
-                    ${shopItem.UseType || 0},       -- نوع الاستخدام
-                    0                               -- SealVal: 0 (جاهز للاستخدام فوراً)
+                    DATEADD(DAY, @days, GETDATE()), 
+                    @grenade, 
+                    @slot, 
+                    @pcbang, 
+                    @level, 
+                    @usetype, 
+                    0
                 )
             `;
             
             await request.query(insertQuery);
 
-            await transaction.commit(); // اعتماد العملية
+            await transaction.commit();
 
             res.json({
                 status: 'success',
@@ -124,12 +141,15 @@ exports.buyItem = async (req, res) => {
             });
 
         } catch (err) {
-            await transaction.rollback(); // إلغاء كل شيء في حال الخطأ
+            await transaction.rollback();
+            // نعيد رمي الخطأ ليتم اصطياده في الـ catch الخارجي
             throw err;
         }
 
     } catch (err) {
         console.error('Shop Purchase Error:', err);
-        res.status(500).json({ message: 'فشلت عملية الشراء', error: err.message });
+        // نرسل رسالة الخطأ المحددة إذا كانت من الـ Atomic Check
+        const msg = err.message.includes('الرصيد غير كافٍ') ? err.message : 'فشلت عملية الشراء';
+        res.status(500).json({ message: msg, error: err.message });
     }
 };

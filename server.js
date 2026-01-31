@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const hpp = require('hpp');
-// const xss = require('xss-clean'); // ❌ هذه المكتبة هي سبب المشكلة، تم حذفها
 require('dotenv').config();
 
 const { poolPromise } = require('./config/db');
@@ -24,17 +23,18 @@ const luckyWheelRoutes = require('./routes/luckyWheelRoutes');
 const cosmeticRoutes = require('./routes/cosmeticRoutes');
 const paypalRoutes = require('./routes/paypalRoutes');
 
-const app = express();
+// 👇 تم التصحيح: استدعاء الملف في سطر منفصل
+const startCronJobs = require('./utils/cronJobs'); 
 
-// 1. إعدادات CORS (مفتوحة للتطوير)
+const app = express(); // 👈 هذا السطر يجب أن يكون نشطاً وليس تعليقاً
+
+// 1. إعدادات CORS
 app.use(cors({
     origin: true,
     credentials: true
 }));
 
 app.use(express.json({ limit: '10kb' }));
-
-// ❌ تم إزالة app.use(xss()) لأنه يسبب الانهيار
 app.use(hpp());
 app.use(morgan('dev'));
 
@@ -57,14 +57,17 @@ app.use('/api/paypal', paypalRoutes);
 
 // 3. فحص السيرفر
 app.get('/', (req, res) => {
-    res.json({ message: 'Server is running perfectly without XSS-Clean!' });
+    res.json({ message: 'Server is running perfectly!' });
 });
+
+// تشغيل الـ Cron Jobs
+startCronJobs(); 
 
 // 4. تشغيل السيرفر
 const PORT = process.env.PORT || 2000;
 app.listen(PORT, () => {
     console.log(`\n===================================================`);
     console.log(`✅ SERVER STARTED ON PORT: ${PORT}`);
-    console.log(`🚫 Removed incompatible library: xss-clean`);
+    console.log(`⏰ Cron Jobs Active`);
     console.log(`===================================================\n`);
 });

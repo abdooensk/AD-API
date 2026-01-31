@@ -1,6 +1,7 @@
 const { poolPromise, sql } = require('../config/db');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
+const crypto = require('crypto'); // مكتبة مدمجة في Node.js
 const { v4: uuidv4 } = require('uuid');
 const { decodeReferralCode } = require('../utils/referralCodec');
 const path = require('path'); // لا تنس استدعاء مكتبة path في أعلى الملف
@@ -8,6 +9,14 @@ require('dotenv').config(); // 👈 مهم لقراءة الإيميل والب�
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_adrenaline_key_2026';
 
+const hashPassword = (password) => {
+    // يجب أن تكون مطابقة تماماً لما فعلناه في SQL Server
+    // HASHBYTES('SHA2_512', password)
+    return crypto.createHash('sha512').update(password).digest('hex').toUpperCase();
+    
+    // ⚠️ إذا استخدمت الـ Salt (UserId + Password) في SQL، يجب أن تفعل مثله هنا:
+    // return crypto.createHash('sha512').update(userId + password).digest('hex').toUpperCase();
+};
 // 📧 إعدادات إرسال الإيميل (يقرأ الآن من ملف .env)
 const transporter = nodemailer.createTransport({
     service: 'gmail',
@@ -43,7 +52,12 @@ exports.login = async (req, res) => {
         const user = result.recordset[0];
 
         if (!user) return res.status(404).json({ message: 'اسم المستخدم غير موجود' });
-        if (user.Password !== password) return res.status(401).json({ message: 'كلمة المرور غير صحيحة' });
+        
+        // 🔥 التعديل هنا: التحقق باستخدام الهاش
+        const inputHash = hashPassword(password);
+        if (user.Password !== inputHash) {
+            return res.status(401).json({ message: 'كلمة المرور غير صحيحة' });
+        }
         
         // التحقق من تفعيل الإيميل (التعديل الجديد)
         if (user.IsEmailVerified === false) {
@@ -118,10 +132,13 @@ exports.register = async (req, res) => {
 
         // 3. الإدخال في قاعدة البيانات
         const verificationToken = require('crypto').randomBytes(32).toString('hex');
+        
+        // 🔥 التعديل هنا: تشفير كلمة المرور قبل الحفظ
+        const hashedPassword = hashPassword(password);
 
         await pool.request()
             .input('uid', userid)
-            .input('pass', password) 
+            .input('pass', hashedPassword) // 👈 نرسل الباسورد المشفر (hashedPassword) بدلاً من العادي
             .input('email', email)
             .input('token', verificationToken)
             .input('ref', referrerUserNo) // 👈 إدخال رقم الداعي
