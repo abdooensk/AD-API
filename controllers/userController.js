@@ -20,8 +20,11 @@ exports.getProfile = async (req, res) => {
                     U.TotalKillCount,
                     U.TotalDeathCount,
                     U.RegDate,
-                    (SELECT TOP 1 C.ClanName FROM ClanDB.dbo.T_Clan C WHERE C.ClanNo = U.ClanNo) AS ClanName
-                FROM GameDB.dbo.T_User U
+                    (SELECT TOP 1 C.ClanName FROM ClanDB.dbo.T_Clan C WHERE C.ClanNo = U.ClanNo) AS ClanName,
+                    
+                    -- 👇 جلب نقاط الولاء (LoyaltyPoints) من جدول الحسابات
+                    -- استخدام ISNULL لضمان إرجاع 0 إذا كانت القيمة NULL
+                    ISNULL((SELECT TOP 1 A.LoyaltyPoints FROM AuthDB.dbo.T_Account A WHERE A.UserNo = U.UserNo), 0) AS LoyaltyPoints                FROM GameDB.dbo.T_User U
                 WHERE U.UserNo = @id
             `);
 

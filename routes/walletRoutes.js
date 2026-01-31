@@ -3,20 +3,19 @@ const express = require('express');
 const router = express.Router();
 const walletController = require('../controllers/walletController');
 const auth = require('../middleware/authMiddleware');
-const validate = require('../middleware/validationMiddleware');
+
+// ✅ 1. استيراد الدالة بشكل صحيح (Destructuring) لتتوافق مع الميدلوير الجديد
+const { validate } = require('../middleware/validationMiddleware');
+
+// ✅ 2. استيراد المخطط
 const { transactionSchema } = require('../utils/validators');
 
-// === أضف هذا الجزء للفحص ===
-console.log("--- DEBUG CHECK ---");
-console.log("1. Auth Middleware:", typeof auth); // يجب أن يكون 'function'
-console.log("2. Validate Middleware:", typeof validate); // يجب أن يكون 'function'
-console.log("3. Schema:", typeof transactionSchema); // يجب أن يكون 'object'
-console.log("4. transferMoney:", typeof walletController.transferMoney); // 👈 أشك أن هذا سيكون 'undefined'
-console.log("5. exchangeCurrency:", typeof walletController.exchangeCurrency); // 👈 أو هذا
-console.log("-------------------");
-// ==========================
+// --- الروابط ---
 
+// تحويل الأموال (محمي بالتوكن + فحص البيانات)
 router.post('/transfer', auth, validate(transactionSchema), walletController.transferMoney);
+
+// تحويل العملة
 router.post('/exchange', auth, validate(transactionSchema), walletController.exchangeCurrency);
 
 module.exports = router;

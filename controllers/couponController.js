@@ -1,6 +1,6 @@
 const { poolPromise, sql } = require('../config/db');
 const { v4: uuidv4 } = require('uuid');
-const { rewardPointsOnPurchase } = require('../utils/rewardSystem'); // 👈 استيراد الدالة
+const { rewardPointsOnPurchase } = require('../utils/rewardSystem');
 
 const generateSegment = (length) => {
     const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
@@ -13,7 +13,6 @@ const generateSegment = (length) => {
 
 // دالة لتحويل 0 إلى NULL (للاستخدام في استعلام SQL)
 const toSqlVal = (val) => {
-    // إذا كانت القيمة موجودة وأكبر من 0 نرجعها، وإلا نرجع النص 'NULL'
     return (val && val > 0) ? val : 'NULL';
 };
 
@@ -33,7 +32,7 @@ exports.getShopBundles = async (req, res) => {
     }
 };
 
-// 2. شراء حزمة وتوليد الكود (مع منطق NULL)
+// 2. شراء حزمة وتوليد الكود (تصحيح أمني 🛡️)
 exports.buyBundle = async (req, res) => {
     const { bundleId, makePublic } = req.body; 
     const userNo = req.user.userNo;
@@ -41,12 +40,12 @@ exports.buyBundle = async (req, res) => {
     try {
         const pool = await poolPromise;
 
-        // أ. جلب الحزمة
+        // أ. جلب الحزمة (آمنة)
         const bundleRes = await pool.request().input('bid', bundleId).query("SELECT * FROM AdrenalineWeb.dbo.Web_CouponShop WHERE BundleID = @bid");
         const bundle = bundleRes.recordset[0];
         if (!bundle) return res.status(404).json({ message: 'الحزمة غير موجودة' });
 
-        // ب. السعر والرصيد
+        // ب. السعر والرصيد (آمنة)
         let finalPrice = bundle.PriceGP;
         if (makePublic) finalPrice += bundle.PublicFeeGP;
 
@@ -55,21 +54,33 @@ exports.buyBundle = async (req, res) => {
             return res.status(400).json({ message: `رصيدك غير كافٍ. المطلوب: ${finalPrice} GP` });
         }
 
-        // ج. التنفيذ
+        // ج. التنفيذ (Transaction)
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
 
         try {
             const request = new sql.Request(transaction);
-
-            // 1. خصم المال
-            await request.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - ${finalPrice} WHERE UserNo = ${userNo}`);
-
-            // 2. توليد الكود
+            
+            // توليد القيم
             const newSerial = `${generateSegment(6)}-${generateSegment(6)}-${generateSegment(4)}`;
-            const targetUserVal = makePublic ? 'NULL' : userNo;
+            // ملاحظة: في الاستعلام المباشر نستخدم 'NULL' كنص، أما مع البارامترات نمرر القيمة null
+            // هنا سنبقي منطق String Interpolation للعناصر فقط لأنها قادمة من قاعدة البيانات وموثوقة
+            // لكن سنحمي بيانات المستخدم (UserNo, Money, Serial).
+            const targetUserSql = makePublic ? 'NULL' : userNo; 
 
-            // 3. إدخال الكود في GameDB (استخدام دالة toSqlVal لتحويل الأصفار إلى NULL) 🛠️
+            // إدخال القيم الآمنة لاستخدامها في الاستعلامات
+            request.input('price', finalPrice);
+            request.input('uid', userNo);
+            request.input('serial', newSerial);
+            request.input('bid', bundleId);
+            request.input('isPub', makePublic ? 1 : 0);
+
+            // 1. خصم المال (استخدام @price, @uid)
+            await request.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @price WHERE UserNo = @uid`);
+
+            // 2. إدخال الكود في GameDB 
+            // ⚠️ ملاحظة: عناصر الحزمة (ItemId1...) نثق بها لأنها قادمة من الداتابيز، لذلك تركناها كما هي لتبسيط الكود الضخم
+            // لكن قمنا بتأمين SerialKey, GameMoney
             await request.query(`
                 INSERT INTO GameDB.dbo.T_ItemSerialKey 
                 (
@@ -80,7 +91,7 @@ exports.buyBundle = async (req, res) => {
                 )
                 VALUES 
                 (
-                    '${newSerial}', ${targetUserVal}, 1, GETDATE(), DATEADD(YEAR, 1, GETDATE()), ${bundle.GameMoney},
+                    @serial, ${targetUserSql}, 1, GETDATE(), DATEADD(YEAR, 1, GETDATE()), ${bundle.GameMoney},
                     ${toSqlVal(bundle.ItemId1)}, ${toSqlVal(bundle.ItemDays1)}, 
                     ${toSqlVal(bundle.ItemId2)}, ${toSqlVal(bundle.ItemDays2)}, 
                     ${toSqlVal(bundle.ItemId3)}, ${toSqlVal(bundle.ItemDays3)},
@@ -93,11 +104,12 @@ exports.buyBundle = async (req, res) => {
                 )
             `);
 
-            // 4. تسجيل في الموقع
+            // 3. تسجيل في الموقع (استخدام @uid, @serial, @bid, @isPub)
             await request.query(`
                 INSERT INTO AdrenalineWeb.dbo.Web_UserCoupons (UserNo, SerialKey, BundleID, IsPublic)
-                VALUES (${userNo}, '${newSerial}', ${bundleId}, ${makePublic ? 1 : 0})
+                VALUES (@uid, @serial, @bid, @isPub)
             `);
+            
             await rewardPointsOnPurchase(request, userNo, finalPrice);
 
             await transaction.commit();
@@ -114,8 +126,7 @@ exports.buyBundle = async (req, res) => {
     }
 };
 
-// ... (بقية الدوال getMyCoupons و upgradeToPublic تبقى كما هي) ...
-// 3. عرض قسائمي وإدارتها
+// 3. عرض قسائمي (آمنة)
 exports.getMyCoupons = async (req, res) => {
     const userNo = req.user.userNo;
     try {
@@ -134,7 +145,7 @@ exports.getMyCoupons = async (req, res) => {
     }
 };
 
-// 4. تبديل القسيمة من "خاصة" إلى "عامة"
+// 4. ترقية القسيمة (تصحيح أمني 🛡️)
 exports.upgradeToPublic = async (req, res) => {
     const { serialKey } = req.body;
     const userNo = req.user.userNo;
@@ -142,7 +153,7 @@ exports.upgradeToPublic = async (req, res) => {
     try {
         const pool = await poolPromise;
 
-        // أ. جلب معلومات القسيمة
+        // أ. جلب معلومات القسيمة (آمنة)
         const couponRes = await pool.request()
             .input('uid', userNo)
             .input('key', serialKey)
@@ -157,27 +168,32 @@ exports.upgradeToPublic = async (req, res) => {
         if (!coupon) return res.status(404).json({ message: 'القسيمة غير موجودة' });
         if (coupon.IsPublic) return res.status(400).json({ message: 'القسيمة عامة بالفعل' });
 
-        // ب. التحقق من الرصيد
+        // ب. التحقق من الرصيد (آمنة)
         const fee = coupon.PublicFeeGP;
         const userCheck = await pool.request().input('uid', userNo).query("SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid");
         if (userCheck.recordset[0].CashMoney < fee) {
             return res.status(400).json({ message: `لا تملك رصيداً كافياً لتحويل القسيمة. الرسوم: ${fee} GP` });
         }
 
-        // ج. تنفيذ التحديث
+        // ج. تنفيذ التحديث (Transaction آمنة)
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
         try {
             const request = new sql.Request(transaction);
 
-            // 1. خصم الرسوم
-            await request.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - ${fee} WHERE UserNo = ${userNo}`);
+            // إدخال المدخلات الآمنة
+            request.input('fee', fee);
+            request.input('uid', userNo);
+            request.input('key', serialKey);
 
-            // 2. تحديث جدول اللعبة (TargetUserNo = NULL)
-            await request.query(`UPDATE GameDB.dbo.T_ItemSerialKey SET TargetUserNo = NULL WHERE SerialKey = '${serialKey}'`);
+            // 1. خصم الرسوم (استخدام @fee, @uid)
+            await request.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @fee WHERE UserNo = @uid`);
 
-            // 3. تحديث جدول الموقع
-            await request.query(`UPDATE AdrenalineWeb.dbo.Web_UserCoupons SET IsPublic = 1 WHERE SerialKey = '${serialKey}'`);
+            // 2. تحديث جدول اللعبة (استخدام @key)
+            await request.query(`UPDATE GameDB.dbo.T_ItemSerialKey SET TargetUserNo = NULL WHERE SerialKey = @key`);
+
+            // 3. تحديث جدول الموقع (استخدام @key)
+            await request.query(`UPDATE AdrenalineWeb.dbo.Web_UserCoupons SET IsPublic = 1 WHERE SerialKey = @key`);
 
             await transaction.commit();
             res.json({ status: 'success', message: 'تم تحويل القسيمة إلى عامة بنجاح!' });

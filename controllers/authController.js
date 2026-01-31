@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const { v4: uuidv4 } = require('uuid');
 const { decodeReferralCode } = require('../utils/referralCodec');
+const path = require('path'); // لا تنس استدعاء مكتبة path في أعلى الملف
 require('dotenv').config(); // 👈 مهم لقراءة الإيميل والباسورد من الملف السري
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_adrenaline_key_2026';
@@ -368,62 +369,9 @@ exports.forgotPassword = async (req, res) => {
 // 🆕 7. عرض صفحة تغيير الباسورد (GET Request)
 // هذه الدالة ترسم صفحة HTML مباشرة في المتصفح بدون ملف خارجي
 exports.getResetPasswordPage = (req, res) => {
-    const { token } = req.query;
-
-    if (!token) return res.send('<h1>رابط غير صالح</h1>');
-
-    // نرسل كود HTML بسيط يحتوي على فورم وإسكربت
-    res.send(`
-        <!DOCTYPE html>
-        <html dir="rtl">
-        <head>
-            <meta charset="UTF-8">
-            <title>تغيير كلمة المرور</title>
-            <style>
-                body { font-family: Arial; background: #222; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-                .box { background: #333; padding: 30px; border-radius: 10px; text-align: center; width: 300px; box-shadow: 0 0 15px rgba(0,0,0,0.5); }
-                input { width: 90%; padding: 10px; margin: 10px 0; border-radius: 5px; border: none; }
-                button { width: 100%; padding: 10px; background: #e74c3c; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; }
-                button:hover { background: #c0392b; }
-            </style>
-        </head>
-        <body>
-            <div class="box">
-                <h2>كلمة المرور الجديدة 🔐</h2>
-                <input type="password" id="newPass" placeholder="أكتب كلمة المرور الجديدة">
-                <button onclick="savePassword()">حفظ التغييرات</button>
-                <p id="msg"></p>
-            </div>
-
-            <script>
-                async function savePassword() {
-                    const pass = document.getElementById('newPass').value;
-                    const token = "${token}"; // السيرفر يضع التوكن هنا تلقائياً
-                    
-                    if(!pass) return alert('أكتب كلمة المرور!');
-
-                    const res = await fetch('/api/auth/reset-password', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ token: token, newPassword: pass })
-                    });
-
-                    const data = await res.json();
-                    const msg = document.getElementById('msg');
-                    
-                    if(data.status === 'success') {
-                        msg.style.color = 'lightgreen';
-                        msg.innerText = 'تم التغيير بنجاح! يمكنك إغلاق الصفحة.';
-                        document.getElementById('newPass').value = '';
-                    } else {
-                        msg.style.color = 'red';
-                        msg.innerText = data.message;
-                    }
-                }
-            </script>
-        </body>
-        </html>
-    `);
+    // نرسل الملف الموجود في مجلد public
+    // لا نحتاج لمعالجة التوكن هنا، لأن الـ Front-end (الملف أعلاه) سيقرأه من الرابط
+    res.sendFile(path.join(__dirname, '../public/reset-password.html'));
 };
 
 // 8. تنفيذ التغيير (POST Request) - (نفس الدالة السابقة)

@@ -1,4 +1,6 @@
 // middleware/validationMiddleware.js
+const Joi = require('joi');
+
 const validate = (schema) => {
     return (req, res, next) => {
         const { error } = schema.validate(req.body, { abortEarly: false });
@@ -15,4 +17,5 @@ const validate = (schema) => {
     };
 };
 
-module.exports = validate; // تأكد من وجود هذا السطر!
+// ✅ التصحيح: التصدير ككائن { validate } لتوحيد الاستخدام في المشروع
+module.exports = { validate };

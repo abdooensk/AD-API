@@ -2,16 +2,16 @@ const express = require('express');
 const router = express.Router();
 const authController = require('../controllers/authController');
 
-// 1. استيراد أدوات التحقق الأمنية
-const validate = require('../middleware/validationMiddleware');
+// ✅ تصحيح الاستيراد: يجب وضع { validate } بين أقواس إذا كان التصدير يتم كـ module.exports = { validate }
+const { validate } = require('../middleware/validationMiddleware');
 const { loginSchema, registerSchema } = require('../utils/validators');
 
 // --- روابط التوثيق الأساسية (محمية بـ Joi) ---
 
-// 1. تسجيل الدخول: نمرر البيانات عبر validate(loginSchema) أولاً
+// 1. تسجيل الدخول
 router.post('/login', validate(loginSchema), authController.login);
 
-// 2. تسجيل جديد: نمرر البيانات عبر validate(registerSchema) أولاً
+// 2. تسجيل جديد
 router.post('/register', validate(registerSchema), authController.register);
 
 // --- روابط تفعيل الحساب ---
@@ -31,9 +31,11 @@ router.post('/change-pending-email', authController.changePendingEmail);
 router.post('/forgot-password', authController.forgotPassword);
 
 // 7. صفحة الويب لاستعادة كلمة المرور (GET)
+// هذه الصفحة تظهر للمستخدم عند الضغط على الرابط في الإيميل
 router.get('/reset-password-page', authController.getResetPasswordPage);
 
 // 8. تنفيذ تغيير الباسورد (POST)
+// هذا الرابط يستقبل الباسورد الجديد من الصفحة
 router.post('/reset-password', authController.resetPassword);
 
 module.exports = router;
