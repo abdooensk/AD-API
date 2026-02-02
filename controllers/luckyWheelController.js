@@ -55,17 +55,32 @@ exports.spinWheel = async (req, res) => {
 
             // منح الجائزة بناءً على نوعها
             // نفترض أن T_UserItem يحتاج ItemType، سنضيف قيمة افتراضية أو نجلبها إذا كانت ناقصة
-            if (selectedItem.RewardType === 'ITEM') {
-                await request.query(`
-                    INSERT INTO GameDB.dbo.T_UserItem 
-                    (UserNo, ItemId, Count, Status, StartDate, EndDate, IsBaseItem, ItemType)
-                    VALUES (${userNo}, ${selectedItem.ItemId}, ${selectedItem.Count}, 1, GETDATE(), DATEADD(DAY, 7, GETDATE()), 0, 1)
-                `);
-            } else if (selectedItem.RewardType === 'GP') { // الكاش (CashMoney)
-                await request.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney + ${selectedItem.RewardAmount} WHERE UserNo = ${userNo}`);
-            } else if (selectedItem.RewardType === 'REGULAR') { // الرصيد العادي (GameMoney)
-                await request.query(`UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney + ${selectedItem.RewardAmount} WHERE UserNo = ${userNo}`);
-            }
+            request.input('uid', userNo);
+request.input('itemId', selectedItem.ItemId);
+request.input('count', selectedItem.Count);
+request.input('wItemId', selectedItem.WheelItemID);
+request.input('wItemName', selectedItem.ItemName); // لحماية الاسم من الأحرف الغريبة
+request.input('rewardAmt', selectedItem.RewardAmount || 0);
+
+if (selectedItem.RewardType === 'ITEM') {
+    // استخدمنا @ بدل ${}
+    await request.query(`
+        INSERT INTO GameDB.dbo.T_UserItem 
+        (UserNo, ItemId, Count, Status, StartDate, EndDate, IsBaseItem, ItemType)
+        VALUES (@uid, @itemId, @count, 1, GETDATE(), DATEADD(DAY, 7, GETDATE()), 0, 1)
+    `);
+} else if (selectedItem.RewardType === 'GP') { 
+    // لاحظ: @rewardAmt و @uid
+    await request.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney + @rewardAmt WHERE UserNo = @uid`);
+} else if (selectedItem.RewardType === 'REGULAR') { 
+    await request.query(`UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney + @rewardAmt WHERE UserNo = @uid`);
+}
+
+// تسجيل العملية بشكل آمن
+await request.query(`
+    INSERT INTO AdrenalineWeb.dbo.Web_WheelLog (UserNo, WheelItemID, RewardName)
+    VALUES (@uid, @wItemId, @wItemName)
+`);
 
             // تسجيل العملية في اللوج
             await request.query(`

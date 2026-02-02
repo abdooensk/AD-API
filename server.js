@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const hpp = require('hpp');
+const path = require('path'); // 👈 أضف هذا السطر
 require('dotenv').config();
 
 const { poolPromise } = require('./config/db');
@@ -54,6 +55,9 @@ app.use('/api/wallet', walletRoutes);
 app.use('/api/wheel', luckyWheelRoutes);
 app.use('/api/cosmetic', cosmeticRoutes);
 app.use('/api/paypal', paypalRoutes);
+app.use('/api/tickets', require('./routes/ticketRoutes'));
+app.use('/public', express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
 
 // 3. فحص السيرفر
 app.get('/', (req, res) => {

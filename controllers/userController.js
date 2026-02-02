@@ -1,5 +1,6 @@
 const { poolPromise, sql } = require('../config/db');
 
+
 // 1. جلب بيانات البروفايل
 exports.getProfile = async (req, res) => {
     try {
@@ -140,11 +141,16 @@ exports.requestUnban = async (req, res) => {
 
     try {
         const pool = await poolPromise;
+        const settingsRes = await pool.request()
+            .query("SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'UnbanFine'");
+        
+        // إذا لم يجد قيمة، يضع 5000 كقيمة افتراضية
+        const fineAmount = settingsRes.recordset[0] ? parseInt(settingsRes.recordset[0].ConfigValue) : 5000;
 
         const checkPending = await pool.request()
             .input('uid', userNo)
             .query("SELECT * FROM AdrenalineWeb.dbo.Web_UnbanRequests WHERE UserNo = @uid AND Status = 'Pending'");
-
+        
         if (checkPending.recordset.length > 0) {
             return res.status(400).json({ message: 'لديك طلب قيد المراجعة بالفعل، يرجى الانتظار' });
         }

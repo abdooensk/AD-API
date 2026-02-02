@@ -192,30 +192,36 @@ exports.redeemCoupon = async (req, res) => {
 
         try {
             const req = new sql.Request(transaction);
+            req.input('uid', userNo);
+            req.input('serial', cleanSerial); // 👈 حماية الكود المدخل
+            req.input('money', coupon.SupplyGameMoney);
 
             // 1. تحديث الحالة
             await req.query(`
-                UPDATE GameDB.dbo.T_ItemSerialKey 
-                SET TargetUserNo = ${userNo}, UseDate = GETDATE(), Status = 2 
-                WHERE SerialKey = '${cleanSerial}'
-            `);
+    UPDATE GameDB.dbo.T_ItemSerialKey 
+    SET TargetUserNo = @uid, UseDate = GETDATE(), Status = 2 
+    WHERE SerialKey = @serial
+`);
 
-            // 2. منح الكاش
-            if (coupon.SupplyGameMoney > 0) {
-                await req.query(`UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney + ${coupon.SupplyGameMoney} WHERE UserNo = ${userNo}`);
-            }
+// 2. منح الكاش
+if (coupon.SupplyGameMoney > 0) {
+    await req.query(`UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney + @money WHERE UserNo = @uid`);
+}
 
-            // 3. دالة إضافة السلاح
-            const giveItem = async (itemId, days) => {
-                if (itemId && itemId > 0) {
-                    await req.query(`
-                        INSERT INTO GameDB.dbo.T_UserItem 
-                        (UserNo, ItemId, Count, Status, StartDate, EndDate, IsBaseItem)
-                        VALUES 
-                        (${userNo}, ${itemId}, 1, 1, GETDATE(), DATEADD(DAY, ${days}, GETDATE()), 0)
-                    `);
-                }
-            };
+// 3. دالة إضافة السلاح (تحتاج تعديل بسيط لتقبل الـ req الموجود)
+const giveItem = async (itemId, days) => {
+    if (itemId && itemId > 0) {
+        // لا يمكننا عمل input جديد داخل نفس الـ request بسهولة داخل اللوب بدون تضارب
+        // الحل: كتابة الاستعلام مباشرة مع القيم (بما أنها أرقام قادمة من الداتا بيس وليست من المستخدم فهي آمنة نسبياً)
+        // الأفضل: استخدام input بأسماء ديناميكية أو استعلام واحد كبير، لكن للتبسيط ولأن المصدر موثوق (جدول الكوبونات):
+        await req.query(`
+            INSERT INTO GameDB.dbo.T_UserItem 
+            (UserNo, ItemId, Count, Status, StartDate, EndDate, IsBaseItem)
+            VALUES 
+            (@uid, ${itemId}, 1, 1, GETDATE(), DATEADD(DAY, ${days}, GETDATE()), 0)
+        `);
+    }
+};
 
             // إضافة العناصر (حلقة تكرارية بسيطة للعناصر الـ 9)
             // ملاحظة: لتحسين الأداء وتجنب التكرار يمكن استخدام مصفوفة، لكن هذا الشكل أوضح للتعديل
@@ -284,16 +290,16 @@ exports.upgradeToPublic = async (req, res) => {
         await transaction.begin();
         try {
             const req = new sql.Request(transaction);
+            req.input('uid', userNo);
+            req.input('fee', fee);
+            req.input('key', serialKey); // 👈 الحماية هنا
 
             // 1. خصم الرسوم
-            await req.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - ${fee} WHERE UserNo = ${userNo}`);
-
+            await req.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @fee WHERE UserNo = @uid`);
             // 2. فك ارتباط المستخدم في GameDB ليصبح متاحاً للغير
-            await req.query(`UPDATE GameDB.dbo.T_ItemSerialKey SET TargetUserNo = NULL WHERE SerialKey = '${serialKey}'`);
-
+            await req.query(`UPDATE GameDB.dbo.T_ItemSerialKey SET TargetUserNo = NULL WHERE SerialKey = @key`);
             // 3. تحديث الحالة في الويب
-            await req.query(`UPDATE AdrenalineWeb.dbo.Web_UserCoupons SET IsPublic = 1 WHERE SerialKey = '${serialKey}'`);
-
+            await req.query(`UPDATE AdrenalineWeb.dbo.Web_UserCoupons SET IsPublic = 1 WHERE SerialKey = @key`);
             await transaction.commit();
             res.json({ status: 'success', message: 'تم تحويل الكوبون إلى عام بنجاح!' });
 

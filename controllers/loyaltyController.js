@@ -73,6 +73,7 @@ exports.getMyLoyaltyStats = async (req, res) => {
 exports.claimDailyReward = async (req, res) => {
     const userNo = req.user.userNo;
     const { rewardType } = req.body; // 'LOGIN' أو 'PLAYTIME'
+    
 
     try {
         const pool = await poolPromise;
@@ -93,6 +94,7 @@ exports.claimDailyReward = async (req, res) => {
         try {
             const request = new sql.Request(transaction);
             let message = "";
+            request.input('uid', userNo); // 👈 إضافة الـ input
 
             if (rewardType === 'LOGIN') {
                 // منطق مكافأة تسجيل الدخول
@@ -131,9 +133,12 @@ exports.claimDailyReward = async (req, res) => {
                 }
 
                 await request.query(`
-                    UPDATE AuthDB.dbo.T_Account SET LoyaltyPoints = LoyaltyPoints + 1 WHERE UserNo = ${userNo};
-                    UPDATE AdrenalineWeb.dbo.Web_DailyAttendance SET PlayRewardClaimed = 1 WHERE UserNo = ${userNo};
-                `);
+        UPDATE AuthDB.dbo.T_Account SET LoyaltyPoints = LoyaltyPoints + 1 WHERE UserNo = @uid; -- استخدم @uid
+        IF EXISTS (SELECT 1 FROM AdrenalineWeb.dbo.Web_DailyAttendance WHERE UserNo = @uid)
+            UPDATE AdrenalineWeb.dbo.Web_DailyAttendance SET LoginRewardClaimed = 1, LastClaimDate = GETDATE() WHERE UserNo = @uid
+        ELSE
+            INSERT INTO AdrenalineWeb.dbo.Web_DailyAttendance (UserNo, LoginRewardClaimed, LastClaimDate) VALUES (@uid, 1, GETDATE());
+    `);
                 message = "تهانينا! أكملت ساعة لعب وحصلت على نقطة ولاء.";
             }
 
@@ -182,13 +187,17 @@ exports.exchangePoints = async (req, res) => {
         await transaction.begin();
         try {
             const request = new sql.Request(transaction);
-            await request.query(`UPDATE AuthDB.dbo.T_Account SET LoyaltyPoints = LoyaltyPoints - ${pointsToSpend} WHERE UserNo = ${userNo}`);
-            
+            request.input('uid', userNo);
+            request.input('points', pointsToSpend);
+            request.input('amount', rewardAmount);
+            request.input('type', type);
+            await request.query(`UPDATE AuthDB.dbo.T_Account SET LoyaltyPoints = LoyaltyPoints - @points WHERE UserNo = @uid`);
+
             const col = type === 'CASH' ? 'CashMoney' : 'GameMoney';
-            await request.query(`UPDATE GameDB.dbo.T_User SET ${col} = ${col} + ${rewardAmount} WHERE UserNo = ${userNo}`);
-            
-            await request.query(`INSERT INTO AdrenalineWeb.dbo.Web_LoyaltyLog (UserNo, PointsSpent, RewardType, RewardAmount, Date) VALUES (${userNo}, ${pointsToSpend}, '${type}', ${rewardAmount}, GETDATE())`);
-            
+// ملاحظة: أسماء الأعمدة لا يمكن وضعها كـ parameter، لذا نترك ${col} كما هي لأننا نتحكم بها برمجياً (ليس من مدخلات المستخدم)، لكن القيم يجب أن تكون parameters
+            await request.query(`UPDATE GameDB.dbo.T_User SET ${col} = ${col} + @amount WHERE UserNo = @uid`);
+
+            await request.query(`INSERT INTO AdrenalineWeb.dbo.Web_LoyaltyLog (UserNo, PointsSpent, RewardType, RewardAmount, Date) VALUES (@uid, @points, @type, @amount, GETDATE())`);
             await transaction.commit();
             res.json({ status: 'success', message: 'تم التحويل بنجاح', newBalance: LoyaltyPoints - pointsToSpend });
         } catch (e) {
