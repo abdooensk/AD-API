@@ -1,134 +1,198 @@
 const { poolPromise, sql } = require('../config/db');
 
-// دالة مساعدة لترجمة نوع العنصر (المترجم الذكي 🧠)
-const getItemTypeLabel = (item) => {
+// المدد المسموح بها فقط (قاعدة صارمة)
+const ALLOWED_DURATIONS = [0, 1, 7, 15, 30];
+
+// 🧠 تحليل نوع العنصر تلقائياً (بناءً على طلبك الدقيق)
+const analyzeItem = (item) => {
+    let label = 'غير معروف';
+    let category = 'ETC'; // تصنيف افتراضي
+
     const type = item.ItemType;
-    
-    // 0: أسلحة (رئيسي، ثانوي، قنابل)
+
+    // 0 = الأسلحة (رئيسي، ثانوي، قنابل)
     if (type === 0) {
-        if (item.IsGrenade) return 'قنبلة 💣';
-        if (item.NeedSlot === 0) return 'سلاح رئيسي 🔫'; // افتراض بناءً على الشائع
-        if (item.NeedSlot === 1) return 'سلاح ثانوي 🔫';
-        return 'سلاح';
+        category = 'WEAPON';
+        if (item.IsGrenade) {
+            label = 'الأسلحة - القنابل';
+        } else if (item.NeedSlot === 1) {
+            label = 'الأسلحة - ثانوي';
+        } else {
+            label = 'الأسلحة - رئيسي';
+        }
+    } 
+    // 1 = الأسلحة - الإضافات
+    else if (type === 1) {
+        category = 'WEAPON'; // أو GEAR حسب رغبتك في الفلترة
+        label = 'الأسلحة - الإظافات';
+    }
+    // 2 = العتاد - خوذة / الأدوات - تعزيزات
+    else if (type === 2) {
+        category = 'GEAR';
+        // محاولة التمييز: عادة التعزيزات ليس لها RestrictLevel أو لها UseType مختلف
+        // لكن للتبسيط سندمجهم في وصف واحد أو نعتبرها خوذة كافتراضي
+        label = 'العتاد - خودة / تعزيزات';
+    }
+    // 3 = العتاد - درع جسد
+    else if (type === 3) {
+        category = 'GEAR';
+        label = 'العتاد - درع جسد';
+    }
+    // 4 = العتاد - الكل
+    else if (type === 4) {
+        category = 'GEAR';
+        label = 'العتاد - الكل';
+    }
+    // 6 = المعدات - الإكسسوارات
+    else if (type === 6) {
+        category = 'ACCESSORY';
+        label = 'المعدات - الإكسسوارات';
+    }
+    // 11 = العتاد - الأبطال
+    else if (type === 11) {
+        category = 'CHARACTER';
+        label = 'العتاد - الأبطال';
+    }
+    // 12 = المعدات - المؤشرات
+    else if (type === 12) {
+        category = 'ACCESSORY';
+        label = 'المعدات - المؤشرات';
+    }
+    // 13 = الأسلحة - سلاح أبيض
+    else if (type === 13) {
+        category = 'WEAPON';
+        label = 'الأسلحة - سلاح أبيض';
     }
 
-    if (type === 1) return 'إضافات سلاح 🔧';
-    if (type === 2) return 'خوذة / تعزيزات ⛑️';
-    if (type === 3) return 'درع جسد 🛡️';
-    if (type === 4) return 'عتاد عام 🎒';
-    if (type === 6) return 'إكسسوارات 💍';
-    if (type === 11) return 'أبطال 🦸';
-    if (type === 12) return 'مؤشرات 🎯';
-    if (type === 13) return 'سلاح أبيض 🔪';
-
-    return 'غير معروف ❓';
+    return { label, category };
 };
 
-// 1. البحث عن عنصر بالاسم (مع التصنيف الجديد)
+// 1. البحث عن عنصر في ملفات اللعبة (T_ItemInfo)
 exports.searchItems = async (req, res) => {
     const { query } = req.query;
+    if (!query || query.length < 2) return res.status(400).json({ message: 'اكتب حرفين للبحث' });
 
-    if (!query || query.length < 2) {
-        return res.status(400).json({ message: 'اكتب حرفين على الأقل للبحث' });
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request()
+            .input('s', `%${query}%`)
+            .query(`
+                SELECT TOP 20 ItemId, ItemName, ItemType, IsGrenade, NeedSlot, RestrictLevel
+                FROM GameDB.dbo.T_ItemInfo 
+                WHERE ItemName LIKE @s 
+                ORDER BY ItemName
+            `);
+
+        const items = result.recordset.map(item => {
+            const analysis = analyzeItem(item);
+            return {
+                ...item,
+                TypeLabel: analysis.label,   // التصنيف الدقيق للعرض
+                AutoCategory: analysis.category // التصنيف العام للفلترة
+            };
+        });
+
+        res.json({ status: 'success', items });
+    } catch (err) { res.status(500).json({ message: 'فشل البحث' }); }
+};
+
+// 2. إضافة عنصر للمتجر (مع التحقق من المدة)
+exports.addItemToShop = async (req, res) => {
+    const { itemId, price, duration, isHot, isNew } = req.body;
+
+    // التحقق من المدة الصارمة
+    if (!ALLOWED_DURATIONS.includes(parseInt(duration))) {
+        return res.status(400).json({ message: 'المدة غير مسموحة! اختر فقط: 0 (دائم)، 1، 7، 15، أو 30 يوم.' });
     }
 
     try {
         const pool = await poolPromise;
         
-        // جلبنا أعمدة إضافية (NeedSlot, IsGrenade) لنتمكن من التصنيف
-        const result = await pool.request()
-            .input('search', `%${query}%`)
-            .query(`
-                SELECT TOP 20 
-                    ItemId, 
-                    ItemName, 
-                    ItemType, 
-                    IsBaseItem,
-                    IsGrenade,
-                    NeedSlot,
-                    CAST(ItemId AS VARCHAR) + '.png' AS ImageName
-                FROM GameDB.dbo.T_ItemInfo 
-                WHERE ItemName LIKE @search
-                ORDER BY ItemName ASC
-            `);
-
-        // معالجة النتائج لإضافة الاسم العربي للننوع
-        const itemsWithLabels = result.recordset.map(item => ({
-            ...item,
-            TypeLabel: getItemTypeLabel(item) // 👈 هنا السحر
-        }));
-
-        res.json({ status: 'success', items: itemsWithLabels });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'فشل البحث' });
-    }
-};
-
-// 2. إضافة العنصر المختار للمتجر
-exports.addItemToShop = async (req, res) => {
-    const { itemId, price, duration, category, isHot, isNew } = req.body;
-
-    if (!itemId || !price || !duration) {
-        return res.status(400).json({ message: 'البيانات ناقصة (السعر، المدة، العنصر)' });
-    }
-
-    try {
-        const pool = await poolPromise;
-
-        // التحقق من وجود العنصر
-        const checkItem = await pool.request().input('id', itemId).query("SELECT ItemName FROM GameDB.dbo.T_ItemInfo WHERE ItemId = @id");
-        if (checkItem.recordset.length === 0) return res.status(404).json({ message: 'العنصر غير موجود!' });
-
-        const itemName = checkItem.recordset[0].ItemName;
-        const imageUrl = `${itemId}.png`;
+        // جلب المعلومات الأصلية من T_ItemInfo لتحديد الفئة
+        const itemCheck = await pool.request().input('id', itemId).query("SELECT ItemType, IsGrenade, NeedSlot, RestrictLevel FROM GameDB.dbo.T_ItemInfo WHERE ItemId = @id");
+        
+        if (itemCheck.recordset.length === 0) return res.status(404).json({ message: 'العنصر غير موجود في ملفات اللعبة' });
+        
+        const analysis = analyzeItem(itemCheck.recordset[0]);
 
         await pool.request()
             .input('id', itemId)
-            .input('name', itemName)
             .input('price', price)
             .input('days', duration)
-            .input('cat', category || 'WEAPON') // يمكن تحسين هذا ليعتمد على TypeLabel مستقبلاً
-            .input('img', imageUrl)
-            .input('hot', isHot || 0)
-            .input('new', isNew || 0)
+            .input('cat', analysis.category) // الفئة تحدد تلقائياً (WEAPON, GEAR, CHARACTER...)
+            .input('hot', isHot ? 1 : 0)
+            .input('new', isNew ? 1 : 0)
             .query(`
                 INSERT INTO AdrenalineWeb.dbo.Web_Shop 
-                (ItemID, ItemName, PriceGP, Duration, Category, ImageURL, IsHot, IsNew, IsActive)
-                VALUES (@id, @name, @price, @days, @cat, @img, @hot, @new, 1)
+                (ItemID, PriceGP, Duration, Category, IsHot, IsNew, IsActive)
+                VALUES (@id, @price, @days, @cat, @hot, @new, 1)
             `);
 
-        res.json({ status: 'success', message: `تم إضافة ${itemName} للمتجر` });
-
-    } catch (err) {
-        res.status(500).json({ message: 'فشل الإضافة' });
-    }
+        res.json({ status: 'success', message: 'تمت الإضافة بنجاح' });
+    } catch (err) { res.status(500).json({ message: 'فشل الإضافة' }); }
 };
 
-// 3. عرض المتجر الحالي
-exports.getShopList = async (req, res) => {
+// 3. تعديل عنصر (السعر/المدة/الحالة)
+exports.updateShopItem = async (req, res) => {
+    const { shopId, price, duration, isHot, isNew } = req.body;
+
+    if (duration !== undefined && !ALLOWED_DURATIONS.includes(parseInt(duration))) {
+        return res.status(400).json({ message: 'المدة غير مسموحة!' });
+    }
+    
     try {
         const pool = await poolPromise;
-        const result = await pool.request().query(`
-            SELECT ShopID, ItemID, ItemName, PriceGP, Duration, Category, ImageURL, IsHot, IsNew 
-            FROM AdrenalineWeb.dbo.Web_Shop 
-            WHERE IsActive = 1
-            ORDER BY ShopID DESC
-        `);
-        res.json({ status: 'success', items: result.recordset });
-    } catch (err) {
-        res.status(500).json({ message: 'خطأ في جلب المتجر' });
-    }
+        await pool.request()
+            .input('sid', shopId)
+            .input('price', price)
+            .input('days', duration)
+            .input('hot', isHot ? 1 : 0)
+            .input('new', isNew ? 1 : 0)
+            .query(`
+                UPDATE AdrenalineWeb.dbo.Web_Shop 
+                SET PriceGP = @price, Duration = @days, IsHot = @hot, IsNew = @new
+                WHERE ShopID = @sid
+            `);
+            
+        res.json({ status: 'success', message: 'تم التعديل' });
+    } catch (err) { res.status(500).json({ message: 'فشل التعديل' }); }
 };
 
-// 4. حذف من المتجر
+// 4. حذف (إخفاء)
 exports.removeFromShop = async (req, res) => {
     const { shopId } = req.params;
     try {
         const pool = await poolPromise;
         await pool.request().input('sid', shopId).query("UPDATE AdrenalineWeb.dbo.Web_Shop SET IsActive = 0 WHERE ShopID = @sid");
         res.json({ status: 'success', message: 'تم الحذف' });
-    } catch (err) {
-        res.status(500).json({ message: 'فشل الحذف' });
-    }
+    } catch (err) { res.status(500).json({ message: 'فشل الحذف' }); }
+};
+
+// 5. عرض قائمة المتجر للأدمن (مع JOIN لجلب الأسماء)
+exports.getShopList = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        // نجلب الاسم ونوع العنصر من جدول اللعبة الأصلي
+        const result = await pool.request().query(`
+            SELECT 
+                S.ShopID, S.ItemID, S.PriceGP, S.Duration, S.Category, S.IsHot, S.IsNew,
+                I.ItemName, I.ItemType, I.IsGrenade, I.NeedSlot,
+                CAST(I.ItemId AS VARCHAR) + '.png' AS ImageURL
+            FROM AdrenalineWeb.dbo.Web_Shop S
+            INNER JOIN GameDB.dbo.T_ItemInfo I ON S.ItemID = I.ItemId
+            WHERE S.IsActive = 1
+            ORDER BY S.ShopID DESC
+        `);
+
+        // إضافة التسمية العربية عند العرض
+        const items = result.recordset.map(item => {
+            const analysis = analyzeItem(item);
+            return {
+                ...item,
+                TypeLabel: analysis.label // هذا ما سيظهر في جدول الأدمن
+            };
+        });
+
+        res.json({ status: 'success', items });
+    } catch (err) { res.status(500).json({ message: 'فشل العرض' }); }
 };

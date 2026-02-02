@@ -1,4 +1,5 @@
 const { poolPromise, sql } = require('../config/db');
+const fs = require('fs'); // 👈 إضافة مهمة لحذف الصور عند الخطأ
 
 // دالة مساعدة لتوليد حروف عشوائية
 const generateSegment = (length) => {
@@ -10,80 +11,141 @@ const generateSegment = (length) => {
     return result;
 };
 
-// دالة مساعدة لتنسيق القيمة لـ SQL (إما رقم أو كلمة NULL)
-const fmtVal = (val) => val ? val : 'NULL';
+// =========================================================
+// 🆕 1. إنشاء قسيمة مميزة (صورة + سعر + 9 عناصر)
+// =========================================================
+exports.createPremiumCoupon = async (req, res) => {
+    const file = req.file;
+    if (!file) return res.status(400).json({ message: 'يجب رفع صورة للقسيمة!' });
+    
+    const imageUrl = `/uploads/coupons/${file.filename}`;
 
-// 1. إنشاء حزمة قسائم للبيع (Bundle)
-exports.createBundle = async (req, res) => {
-    const { name, desc, priceGP, publicFee, items } = req.body;
+    // 👇 نستقبل الآن publicFee من البيانات
+    const { title, price, publicFee, description, items } = req.body;
 
-    try {
-        const pool = await poolPromise;
-        const request = pool.request()
-            .input('name', name)
-            .input('desc', desc)
-            .input('price', priceGP)
-            .input('fee', publicFee || 2000);
-
-        // تجهيز القيم: إذا لم يوجد العنصر نستخدم 0 للمتجر (لان Web_CouponShop يفضل 0)
-        // لكن إذا أردت NULL في المتجر أيضاً، غير 0 إلى 'NULL'
-        // ملاحظة: عادة جداول الويب تقبل 0 كقيمة افتراضية، لكن سنتركها 0 هنا لعدم تعقيد العرض
-        const safeItems = [];
-        for (let i = 0; i < 9; i++) {
-            safeItems[i] = items && items[i] ? items[i] : { id: 0, days: 0 };
-        }
-
-        await request.query(`
-            INSERT INTO AdrenalineWeb.dbo.Web_CouponShop 
-            (
-                BundleName, Description, PriceGP, PublicFeeGP, 
-                ItemId1, ItemDays1, ItemId2, ItemDays2, ItemId3, ItemDays3, 
-                ItemId4, ItemDays4, ItemId5, ItemDays5, ItemId6, ItemDays6, 
-                ItemId7, ItemDays7, ItemId8, ItemDays8, ItemId9, ItemDays9
-            )
-            VALUES 
-            (
-                @name, @desc, @price, @fee,
-                ${safeItems[0].id}, ${safeItems[0].days}, ${safeItems[1].id}, ${safeItems[1].days}, ${safeItems[2].id}, ${safeItems[2].days},
-                ${safeItems[3].id}, ${safeItems[3].days}, ${safeItems[4].id}, ${safeItems[4].days}, ${safeItems[5].id}, ${safeItems[5].days},
-                ${safeItems[6].id}, ${safeItems[6].days}, ${safeItems[7].id}, ${safeItems[7].days}, ${safeItems[8].id}, ${safeItems[8].days}
-            )
-        `);
-
-        res.json({ status: 'success', message: 'تم إنشاء الحزمة في المتجر بنجاح' });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'فشل إنشاء الحزمة', error: err.message });
+    if (!title || !price) {
+        fs.unlinkSync(file.path);
+        return res.status(400).json({ message: 'العنوان والسعر مطلوبان' });
     }
-};
 
-// 2. إنشاء "قسيمة هدية" (Promo Code) - هنا التعديل المهم لـ NULL
-exports.createGiftCoupon = async (req, res) => {
-    const { customCode, expireDays, maxUses, items, gameMoney } = req.body; 
+    let parsedItems = [];
+    try {
+        parsedItems = typeof items === 'string' ? JSON.parse(items) : items;
+    } catch (e) {
+        fs.unlinkSync(file.path);
+        return res.status(400).json({ message: 'تنسيق العناصر غير صحيح' });
+    }
+
+    const slots = Array(9).fill({ id: 0, days: 0 });
+    if (Array.isArray(parsedItems)) {
+        parsedItems.slice(0, 9).forEach((item, index) => {
+            slots[index] = { id: parseInt(item.id) || 0, days: parseInt(item.days) || 0 };
+        });
+    }
+
+    // تحديد قيمة الرسوم (إذا لم ترسل نعتبرها 0)
+    const fee = publicFee ? parseInt(publicFee) : 0;
 
     try {
         const pool = await poolPromise;
         
-        // توليد الكود
+        await pool.request()
+            .input('title', title)
+            .input('price', price)
+            .input('fee', fee) // 👈 إدخال الرسوم
+            .input('img', imageUrl)
+            .input('desc', description || '')
+            
+            // العناصر الـ 9
+            .input('i1', slots[0].id).input('d1', slots[0].days)
+            .input('i2', slots[1].id).input('d2', slots[1].days)
+            .input('i3', slots[2].id).input('d3', slots[2].days)
+            .input('i4', slots[3].id).input('d4', slots[3].days)
+            .input('i5', slots[4].id).input('d5', slots[4].days)
+            .input('i6', slots[5].id).input('d6', slots[5].days)
+            .input('i7', slots[6].id).input('d7', slots[6].days)
+            .input('i8', slots[7].id).input('d8', slots[7].days)
+            .input('i9', slots[8].id).input('d9', slots[8].days)
+
+            .query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_PremiumCoupons
+                (
+                    Title, PriceGP, PublicFeeGP, ImageURL, Description, -- 👈 أضفنا PublicFeeGP هنا
+                    ItemId1, ItemDays1, ItemId2, ItemDays2, ItemId3, ItemDays3,
+                    ItemId4, ItemDays4, ItemId5, ItemDays5, ItemId6, ItemDays6,
+                    ItemId7, ItemDays7, ItemId8, ItemDays8, ItemId9, ItemDays9, IsActive
+                )
+                VALUES
+                (
+                    @title, @price, @fee, @img, @desc, -- 👈 وأضفنا المتغير @fee هنا
+                    @i1, @d1, @i2, @d2, @i3, @d3,
+                    @i4, @d4, @i5, @d5, @i6, @d6,
+                    @i7, @d7, @i8, @d8, @i9, @d9, 1
+                )
+            `);
+
+        res.json({ status: 'success', message: 'تم إنشاء القسيمة المميزة بنجاح', imageUrl });
+
+    } catch (err) {
+        console.error(err);
+        if (file && fs.existsSync(file.path)) fs.unlinkSync(file.path);
+        res.status(500).json({ message: 'فشل إنشاء القسيمة', error: err.message });
+    }
+};
+
+// =========================================================
+// 2. عرض القسائم المميزة (للأدمن)
+// =========================================================
+exports.getPremiumCoupons = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request().query("SELECT * FROM AdrenalineWeb.dbo.Web_PremiumCoupons ORDER BY CouponID DESC");
+        res.json({ status: 'success', coupons: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'فشل جلب البيانات' });
+    }
+};
+
+// =========================================================
+// 3. حذف قسيمة مميزة
+// =========================================================
+exports.deletePremiumCoupon = async (req, res) => {
+    const { id } = req.params;
+    try {
+        const pool = await poolPromise;
+        await pool.request().input('id', id).query("UPDATE AdrenalineWeb.dbo.Web_PremiumCoupons SET IsActive = 0 WHERE CouponID = @id");
+        res.json({ status: 'success', message: 'تم حذف القسيمة' });
+    } catch (err) {
+        res.status(500).json({ message: 'فشل الحذف' });
+    }
+};
+
+// =========================================================
+// 4. إنشاء "قسيمة هدية" (الكود القديم - Promo Code)
+// =========================================================
+exports.createGiftCoupon = async (req, res) => {
+    const { customCode, expireDays, items, gameMoney } = req.body; 
+
+    try {
+        const pool = await poolPromise;
+        
         let serialKey = customCode;
         if (!serialKey) {
             serialKey = `${generateSegment(6)}-${generateSegment(6)}-${generateSegment(4)}`;
         }
         serialKey = serialKey.toUpperCase();
 
-        // تجهيز مصفوفة العناصر بقيم NULL إذا كانت فارغة
         const dbItems = [];
         for (let i = 0; i < 9; i++) {
             if (items && items[i] && items[i].id > 0) {
                 dbItems[i] = { id: items[i].id, days: items[i].days };
             } else {
-                dbItems[i] = { id: 'NULL', days: 'NULL' }; // 👈 نستخدم النص 'NULL'
+                dbItems[i] = { id: 'NULL', days: 'NULL' };
             }
         }
 
         const money = gameMoney || 0;
 
-        // الإدخال في GameDB باستخدام القيم التي قد تكون NULL
         await pool.request().query(`
             INSERT INTO GameDB.dbo.T_ItemSerialKey 
             (

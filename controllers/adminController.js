@@ -1,5 +1,10 @@
 const { poolPromise, sql } = require('../config/db');
+const crypto = require('crypto'); // 👈 إضافة مكتبة التشفير
 const { logAdminAction } = require('../utils/adminLogger'); // 👈 استدعاء الأداة الجديدة
+
+const hashPassword = (password) => {
+    return crypto.createHash('sha512').update(password).digest('hex').toUpperCase();
+};
 
 // 1. حظر لاعب (Ban Player)
 exports.banPlayer = async (req, res) => {
@@ -128,8 +133,8 @@ exports.approveUnban = async (req, res) => {
 
 // 🆕 تغيير بيانات اللاعب بالقوة (للأدمن فقط)
 exports.forceChangeCredentials = async (req, res) => {
-    // نطلب: اسم اللاعب المستهدف، (اختياري: باسورد جديد)، (اختياري: إيميل جديد)
     const { targetUsername, newPassword, newEmail } = req.body;
+    const adminName = req.user.userId; // اسم الأدمن الذي قام بالعملية (للتسجيل)
 
     if (!targetUsername) {
         return res.status(400).json({ message: 'يجب تحديد اسم المستخدم (Target Username)' });
@@ -142,7 +147,7 @@ exports.forceChangeCredentials = async (req, res) => {
     try {
         const pool = await poolPromise;
 
-        // 1. التحقق من وجود اللاعب
+        // 1. التحقق من وجود اللاعب وجلب رقمه
         const userCheck = await pool.request()
             .input('uid', targetUsername)
             .query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE UserId = @uid");
@@ -152,33 +157,46 @@ exports.forceChangeCredentials = async (req, res) => {
         }
 
         const targetUserNo = userCheck.recordset[0].UserNo;
+        let changesLog = []; // لتسجيل ماذا تغير بالضبط
 
         // 2. تغيير الإيميل (إذا تم إرساله)
         if (newEmail) {
-            // التأكد أن الإيميل غير مستخدم من قبل شخص آخر
+            // التأكد أن الإيميل غير مستخدم
             const emailCheck = await pool.request()
                 .input('email', newEmail)
-                .input('uid', targetUserNo) // استثناء اللاعب نفسه
+                .input('uid', targetUserNo)
                 .query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE Email = @email AND UserNo != @uid");
 
             if (emailCheck.recordset.length > 0) {
                 return res.status(400).json({ message: 'البريد الإلكتروني الجديد مستخدم بالفعل في حساب آخر' });
             }
 
-            // تحديث الإيميل + تفعيله فوراً (لأن الأدمن هو من قام بالتغيير)
             await pool.request()
                 .input('email', newEmail)
                 .input('uid', targetUserNo)
                 .query("UPDATE AuthDB.dbo.T_Account SET Email = @email, IsEmailVerified = 1, VerificationToken = NULL WHERE UserNo = @uid");
+            
+            changesLog.push(`Email changed to ${newEmail}`);
         }
 
-        // 3. تغيير الباسورد (إذا تم إرساله)
+        // 3. تغيير الباسورد (إذا تم إرساله) - 🔥 هنا الإصلاح
         if (newPassword) {
+            // ✅ نقوم بتشفير الباسورد بنفس الطريقة المستخدمة في التسجيل
+            const hashedPassword = hashPassword(newPassword);
+
             await pool.request()
-                .input('pass', newPassword)
+                .input('pass', hashedPassword) // 👈 نرسل المشفر
                 .input('uid', targetUserNo)
                 .query("UPDATE AuthDB.dbo.T_Account SET Password = @pass, PasswordResetToken = NULL WHERE UserNo = @uid");
+
+            changesLog.push('Password changed');
         }
+
+        // 4. تسجيل العملية في سجلات الأدمن (خطوة إضافية مفضلة)
+        // إذا كان لديك جدول Web_AdminLog، يفضل تسجيل هذه العملية الحساسة
+        /*
+        await logAdminAction(adminName, 'FORCE_CHANGE', `Changed credentials for ${targetUsername}: ${changesLog.join(', ')}`);
+        */
 
         res.json({ 
             status: 'success', 

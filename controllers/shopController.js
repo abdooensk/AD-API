@@ -1,130 +1,122 @@
 const { poolPromise, sql } = require('../config/db');
 
-// 1. عرض عناصر المتجر (لم يتغير)
+// 1. عرض عناصر المتجر (كما هي)
 exports.getShopItems = async (req, res) => {
+    const { category } = req.query;
+
     try {
         const pool = await poolPromise;
-        const result = await pool.request()
-            .query(`
-                SELECT ShopID, ItemName, PriceGP, Duration, Count, Category, ImageURL 
-                FROM AdrenalineWeb.dbo.Web_Shop 
-                WHERE IsActive = 1
-            `);
+        let query = `
+            SELECT 
+                S.ShopID, S.ItemID, S.PriceGP, S.Duration, S.Category, S.IsHot, S.IsNew,
+                I.ItemName,
+                CAST(I.ItemId AS VARCHAR) + '.png' AS ImageURL,
+                I.ItemType
+            FROM AdrenalineWeb.dbo.Web_Shop S
+            INNER JOIN GameDB.dbo.T_ItemInfo I ON S.ItemID = I.ItemId
+            WHERE S.IsActive = 1
+        `;
+        
+        if (category && category !== 'ALL') {
+            query += ` AND S.Category = @cat`;
+        }
+        
+        query += " ORDER BY S.IsHot DESC, S.IsNew DESC, S.ShopID DESC";
+
+        const request = pool.request();
+        if (category && category !== 'ALL') request.input('cat', category);
+
+        const result = await request.query(query);
 
         res.json({ status: 'success', items: result.recordset });
     } catch (err) {
-        res.status(500).json({ message: 'خطأ في جلب المتجر', error: err.message });
+        res.status(500).json({ message: 'خطأ في جلب المتجر' });
     }
 };
 
-// 2. شراء عنصر (الكود الجديد بناءً على sp_BuyItem)
+// 2. شراء عنصر (باستخدام Stored Procedures)
 exports.buyItem = async (req, res) => {
     const { shopId } = req.body;
-    const userNo = req.user.userNo;
+    const userNo = req.user.userId; // تأكد من أن الميدل وير يمرر userId
 
     try {
         const pool = await poolPromise;
 
-        // 🛡️ أمان 1: التحقق من سعة الحقيبة
-        // (لمنع تعليق الحساب أو ضياع العنصر إذا كانت الحقيبة ممتلئة)
-        const inventoryCheck = await pool.request()
-            .input('uid', sql.Int, userNo)
-            .query('SELECT COUNT(*) as cnt FROM GameDB.dbo.T_UserItem WHERE UserNo = @uid');
+        // أ. فحص سعة الحقيبة (أمان إضافي قبل استدعاء الـ SP)
+        const invCheck = await pool.request()
+            .input('u', userNo)
+            .query("SELECT COUNT(*) as cnt FROM GameDB.dbo.T_UserItem WHERE UserNo = @u AND Status != 2");
         
-        if (inventoryCheck.recordset[0].cnt >= 240) {
-            return res.status(400).json({ message: 'الحقيبة ممتلئة! يرجى حذف بعض العناصر أولاً.' });
+        if (invCheck.recordset[0].cnt >= 240) {
+            return res.status(400).json({ message: 'الحقيبة ممتلئة! يرجى حذف بعض العناصر.' });
         }
 
-        // 🔍 2. جلب البيانات (دمج السعر من الموقع مع خصائص اللعبة الأصلية)
-        const itemQuery = await pool.request()
-            .input('sid', sql.Int, shopId)
+        // ب. جلب بيانات العنصر من المتجر لمعرفة الـ ID والنوع
+        const shopItem = await pool.request()
+            .input('sid', shopId)
             .query(`
-                SELECT 
-                    S.PriceGP, S.Duration, 
-                    I.ItemId, I.ItemName, I.ItemType, I.UseType, I.IsBaseItem, 
-                    I.IsGrenade, I.NeedSlot, I.RestrictLevel, I.IsPcBangItem
+                SELECT S.Duration, I.ItemId, I.ItemName, I.ItemType
                 FROM AdrenalineWeb.dbo.Web_Shop S
-                JOIN GameDB.dbo.T_ItemInfo I ON S.ItemID = I.ItemId
+                INNER JOIN GameDB.dbo.T_ItemInfo I ON S.ItemID = I.ItemId
                 WHERE S.ShopID = @sid AND S.IsActive = 1
             `);
 
-        const itemData = itemQuery.recordset[0];
+        if (shopItem.recordset.length === 0) {
+            return res.status(404).json({ message: 'العنصر غير متاح' });
+        }
+        
+        const item = shopItem.recordset[0];
 
-        if (!itemData) {
-            return res.status(404).json({ message: 'العنصر غير متاح حالياً' });
+        // ج. تجهيز استدعاء الـ Stored Procedure
+        const request = pool.request();
+        
+        // إعداد المتغيرات حسب كود SQL الذي أرسلته
+        request.input('OwnerUserNo', userNo);
+        request.input('BuyItemId', item.ItemId);
+        request.input('BuyDay', item.Duration); // المدة (1, 7, 15, 30)
+        request.input('UseGamePoint', 0);       // 0 = شراء بالكاش (Cash)
+        request.input('IsNewAdd', 1);           // 1 = إضافة جديدة
+        request.output('Result', sql.Int);      // لاستقبال نتيجة العملية
+
+        // د. تحديد الـ SP المناسب حسب نوع العنصر
+        let spName = 'GameDB.dbo.sp_BuyItem';
+        if (item.ItemType === 11) { // 11 = أبطال (Heroes)
+            spName = 'GameDB.dbo.sp_BuyItemHeroes';
         }
 
-        // 🛡️ أمان 2: استخدام الترانزاكشن (الكل أو لا شيء)
-        const transaction = new sql.Transaction(pool);
-        await transaction.begin();
+        // هـ. التنفيذ
+        const result = await request.execute(spName);
+        const returnCode = result.output.Result; // 0 = نجاح، 1 = رصيد غير كاف
 
-        try {
-            const request = new sql.Request(transaction);
-
-            request.input('uid', sql.Int, userNo);
-            request.input('price', sql.Int, itemData.PriceGP);
-
-            // 🔥 أمان 3: الخصم الذري (Atomic Deduction)
-            // هذا هو أهم سطر للأمان! نضع شرط الرصيد داخل جملة التحديث نفسها
-            const deductResult = await request.query(`
-                UPDATE GameDB.dbo.T_User 
-                SET CashMoney = CashMoney - @price 
-                WHERE UserNo = @uid AND CashMoney >= @price
-            `);
-
-            // إذا لم يتأثر أي صف، فهذا يعني أن الرصيد لم يكن كافياً لحظة التنفيذ
-            if (deductResult.rowsAffected[0] === 0) {
-                throw new Error('رصيدك غير كافٍ لإتمام العملية');
-            }
-
-            // إعداد متغيرات الإضافة (من T_ItemInfo الموثوقة)
-            request.input('days', sql.Int, itemData.Duration);
-            request.input('itemId', sql.Int, itemData.ItemId);
-            request.input('type', sql.Int, itemData.ItemType);
-            request.input('usetype', sql.Int, itemData.UseType);
-            request.input('base', sql.Bit, itemData.IsBaseItem);
-            request.input('grenade', sql.Bit, itemData.IsGrenade);
-            request.input('slot', sql.Int, itemData.NeedSlot);
-            request.input('level', sql.Int, itemData.RestrictLevel);
-            request.input('pcbang', sql.Bit, itemData.IsPcBangItem);
+        // و. معالجة النتيجة
+        if (returnCode === 0) {
+            // نجاح العملية
             
-            // ثوابت النظام
-            request.input('seal', sql.Int, 1);     // 1 = مختوم (لأن الدفع كاش)
-            request.input('durability', sql.Int, 1000); 
+            // قراءة تكلفة الشراء من النتيجة لتسجيلها في السجلات (الـ SP يعيد جدولاً فيه ItemCash)
+            // ملاحظة: الـ SP يحسب السعر بناءً على T_ItemInfo وليس Web_Shop
+            const record = result.recordset && result.recordset.length > 0 ? result.recordset[0] : {};
+            const cost = record.ItemCash || 0;
 
-            // 3. إضافة السلاح (مطابق تماماً لجدول GameDB)
-            await request.query(`
-                INSERT INTO GameDB.dbo.T_UserItem 
-                (
-                    UserNo, ItemId, ItemType, UseType, IsBaseItem, IsGrenade, NeedSlot, 
-                    Status, StartDate, EndDate, IsPcBangItem, RestrictLevel, 
-                    SealVal, Durability, Count, CharacterNo, WeaponSlotNo, TargetSerialNo
-                )
-                VALUES 
-                (
-                    @uid, @itemId, @type, @usetype, @base, @grenade, @slot, 
-                    1, GETDATE(), DATEADD(DAY, @days, GETDATE()), @pcbang, @level, 
-                    @seal, @durability, 1, 0, 0, 0
-                )
-            `);
+            // تسجيل العملية في Web_EconomyLog للمراقبة
+            await pool.request()
+                .input('u', userNo)
+                .input('amt', cost)
+                .input('desc', `Shop Buy: ${item.ItemName} (SP)`)
+                .query(`
+                    INSERT INTO AdrenalineWeb.dbo.Web_EconomyLog 
+                    (UserNo, ActionType, Amount, Currency, Description, LogDate)
+                    VALUES (@u, 'SHOP_BUY', @amt, 'CASH', @desc, GETDATE())
+                `);
 
-            await transaction.commit();
-
-            res.json({
-                status: 'success',
-                message: `تم شراء ${itemData.ItemName} بنجاح!`,
-            });
-
-        } catch (err) {
-            await transaction.rollback();
-            // إعادة رسالة خطأ واضحة للمستخدم
-            const msg = err.message === 'رصيدك غير كافٍ لإتمام العملية' ? err.message : 'فشلت عملية الشراء';
-            if (msg !== err.message) console.error('Buy Error:', err); // نسجل الخطأ التقني في الكونسول فقط
-            res.status(400).json({ message: msg });
+            res.json({ status: 'success', message: `تم شراء ${item.ItemName} بنجاح` });
+        } else if (returnCode === 1) {
+            res.status(400).json({ message: 'رصيد الكاش غير كافٍ لإتمام العملية' });
+        } else {
+            res.status(500).json({ message: 'فشلت عملية الشراء لسبب غير معروف' });
         }
 
     } catch (err) {
-        console.error('Controller Error:', err);
-        res.status(500).json({ message: 'خطأ في السيرفر' });
+        console.error('Buy Error:', err);
+        res.status(500).json({ message: 'حدث خطأ في السيرفر أثناء الشراء' });
     }
 };

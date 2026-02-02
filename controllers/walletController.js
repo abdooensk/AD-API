@@ -221,4 +221,11 @@ exports.transferMoney = async (req, res) => {
         console.error(err);
         res.status(500).json({ message: "خطأ في السيرفر" });
     }
+    await pool.request()
+    .input('u', senderUserNo)
+    .input('act', 'TRANSFER_SEND')
+    .input('amt', amount)
+    .input('curr', 'CASH')
+    .input('desc', `Sent to User ${receiverUserNo}`)
+    .query("INSERT INTO AdrenalineWeb.dbo.Web_EconomyLog (UserNo, ActionType, Amount, Currency, Description) VALUES (@u, @act, @amt, @curr, @desc)");
 };
