@@ -70,7 +70,13 @@ exports.login = async (req, res) => {
 
         const isBanned = user.IsBanned === 1 || user.IsBanned === true;
         const token = jwt.sign(
-            { userNo: user.UserNo, userId: user.UserId, isAdmin: user.GMGrade >= 1, isBanned: isBanned },
+            { 
+                userNo: user.UserNo, 
+                userId: user.UserId, 
+                isAdmin: user.GMGrade >= 1, 
+                role: user.GMGrade, // ✅ ضروري جداً لعمل requireRole
+                isBanned: isBanned 
+            },
             JWT_SECRET, { expiresIn: '24h' }
         );
 
@@ -83,6 +89,7 @@ exports.login = async (req, res) => {
                 username: user.UserId,
                 nickname: user.Nickname || null,
                 isGM: user.GMGrade >= 1,
+                grade: user.GMGrade, // يفضل إرجاعه للفرونت إند أيضاً
                 isBanned: isBanned
             }
         });
@@ -392,41 +399,42 @@ exports.getResetPasswordPage = (req, res) => {
 };
 
 // 8. تنفيذ التغيير (POST Request) - (نفس الدالة السابقة)
+// 8. تنفيذ تغيير كلمة المرور (مصحح: يقوم بالتشفير الآن)
 exports.resetPassword = async (req, res) => {
     const { token, newPassword } = req.body;
-    // ... (نفس الكود السابق تماماً) ...
-    if (!token || !newPassword) return res.status(400).json({ message: 'البيانات ناقصة' });
 
-    try {
-        const pool = await poolPromise;
-        const result = await pool.request().input('token', token).query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE PasswordResetToken = @token AND ResetTokenExpiry > GETDATE()");
-
-        if (result.recordset.length === 0) return res.status(400).json({ message: 'الرابط منتهي أو غير صالح' });
-
-        await pool.request().input('pass', newPassword).input('uid', result.recordset[0].UserNo).query("UPDATE AuthDB.dbo.T_Account SET Password = @pass, PasswordResetToken = NULL, ResetTokenExpiry = NULL WHERE UserNo = @uid");
-
-        res.json({ status: 'success', message: 'تم تغيير كلمة المرور بنجاح' });
-    } catch (err) {
-        res.status(500).json({ message: 'خطأ سيرفر' });
+    if (!token || !newPassword) {
+        return res.status(400).json({ message: 'البيانات ناقصة' });
     }
-};
-
-// 7. تنفيذ تغيير كلمة المرور (كما هو في نسختك)
-exports.resetPassword = async (req, res) => {
-    const { token, newPassword } = req.body;
-    if (!token || !newPassword) return res.status(400).json({ message: 'البيانات ناقصة' });
 
     try {
         const pool = await poolPromise;
-        const result = await pool.request().input('token', token).query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE PasswordResetToken = @token AND ResetTokenExpiry > GETDATE()");
 
-        if (result.recordset.length === 0) return res.status(400).json({ message: 'الرابط منتهي أو غير صالح' });
+        // 1. التحقق من صحة التوكن وتاريخ انتهائه
+        const result = await pool.request()
+            .input('token', token)
+            .query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE PasswordResetToken = @token AND ResetTokenExpiry > GETDATE()");
 
-        await pool.request().input('pass', newPassword).input('uid', result.recordset[0].UserNo).query("UPDATE AuthDB.dbo.T_Account SET Password = @pass, PasswordResetToken = NULL, ResetTokenExpiry = NULL WHERE UserNo = @uid");
+        if (result.recordset.length === 0) {
+            return res.status(400).json({ message: 'الرابط منتهي أو غير صالح' });
+        }
+
+        // 2. تشفير كلمة المرور الجديدة (هنا كان الخطأ) 🔒
+        // نستخدم نفس الدالة المستخدمة في التسجيل (hashPassword)
+        // الموجودة في أعلى الملف
+        const hashedPassword = hashPassword(newPassword);
+
+        // 3. تحديث كلمة المرور المشفرة في قاعدة البيانات
+        await pool.request()
+            .input('pass', hashedPassword) // 👈 إرسال النسخة المشفرة
+            .input('uid', result.recordset[0].UserNo)
+            .query("UPDATE AuthDB.dbo.T_Account SET Password = @pass, PasswordResetToken = NULL, ResetTokenExpiry = NULL WHERE UserNo = @uid");
 
         res.json({ status: 'success', message: 'تم تغيير كلمة المرور بنجاح' });
+
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'فشل تغيير كلمة المرور' });
     }
 };
+// 7. تنفيذ تغيير كلمة المرور (كما هو في نسختك)

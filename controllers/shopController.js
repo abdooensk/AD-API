@@ -1,6 +1,8 @@
 const { poolPromise, sql } = require('../config/db');
 
-// 1. عرض عناصر المتجر (كما هي)
+// ==========================================
+// 1. عرض عناصر المتجر
+// ==========================================
 exports.getShopItems = async (req, res) => {
     const { category } = req.query;
 
@@ -11,7 +13,7 @@ exports.getShopItems = async (req, res) => {
                 S.ShopID, S.ItemID, S.PriceGP, S.Duration, S.Category, S.IsHot, S.IsNew,
                 I.ItemName,
                 CAST(I.ItemId AS VARCHAR) + '.png' AS ImageURL,
-                I.ItemType
+                I.ItemType -- نحتاجه للعرض
             FROM AdrenalineWeb.dbo.Web_Shop S
             INNER JOIN GameDB.dbo.T_ItemInfo I ON S.ItemID = I.ItemId
             WHERE S.IsActive = 1
@@ -34,15 +36,21 @@ exports.getShopItems = async (req, res) => {
     }
 };
 
-// 2. شراء عنصر (باستخدام Stored Procedures)
+// ==========================================
+// 2. شراء عنصر (محاكاة دقيقة لـ sp_BuyItem مع سعر الموقع)
+// ==========================================
 exports.buyItem = async (req, res) => {
     const { shopId } = req.body;
-    const userNo = req.user.userId; // تأكد من أن الميدل وير يمرر userId
+    const userNo = req.user.userNo || req.user.userId; 
+
+    if (!shopId) return res.status(400).json({ message: 'رقم العنصر مطلوب' });
 
     try {
         const pool = await poolPromise;
 
-        // أ. فحص سعة الحقيبة (أمان إضافي قبل استدعاء الـ SP)
+        // ---------------------------------------------------------
+        // 1. فحص سعة الحقيبة (إجراء حماية إضافي)
+        // ---------------------------------------------------------
         const invCheck = await pool.request()
             .input('u', userNo)
             .query("SELECT COUNT(*) as cnt FROM GameDB.dbo.T_UserItem WHERE UserNo = @u AND Status != 2");
@@ -51,72 +59,130 @@ exports.buyItem = async (req, res) => {
             return res.status(400).json({ message: 'الحقيبة ممتلئة! يرجى حذف بعض العناصر.' });
         }
 
-        // ب. جلب بيانات العنصر من المتجر لمعرفة الـ ID والنوع
-        const shopItem = await pool.request()
-            .input('sid', shopId)
-            .query(`
-                SELECT S.Duration, I.ItemId, I.ItemName, I.ItemType
-                FROM AdrenalineWeb.dbo.Web_Shop S
-                INNER JOIN GameDB.dbo.T_ItemInfo I ON S.ItemID = I.ItemId
-                WHERE S.ShopID = @sid AND S.IsActive = 1
-            `);
+        // ---------------------------------------------------------
+        // 2. بدء المعاملة المالية (Transaction)
+        // ---------------------------------------------------------
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
 
-        if (shopItem.recordset.length === 0) {
-            return res.status(404).json({ message: 'العنصر غير متاح' });
-        }
-        
-        const item = shopItem.recordset[0];
-
-        // ج. تجهيز استدعاء الـ Stored Procedure
-        const request = pool.request();
-        
-        // إعداد المتغيرات حسب كود SQL الذي أرسلته
-        request.input('OwnerUserNo', userNo);
-        request.input('BuyItemId', item.ItemId);
-        request.input('BuyDay', item.Duration); // المدة (1, 7, 15, 30)
-        request.input('UseGamePoint', 0);       // 0 = شراء بالكاش (Cash)
-        request.input('IsNewAdd', 1);           // 1 = إضافة جديدة
-        request.output('Result', sql.Int);      // لاستقبال نتيجة العملية
-
-        // د. تحديد الـ SP المناسب حسب نوع العنصر
-        let spName = 'GameDB.dbo.sp_BuyItem';
-        if (item.ItemType === 11) { // 11 = أبطال (Heroes)
-            spName = 'GameDB.dbo.sp_BuyItemHeroes';
-        }
-
-        // هـ. التنفيذ
-        const result = await request.execute(spName);
-        const returnCode = result.output.Result; // 0 = نجاح، 1 = رصيد غير كاف
-
-        // و. معالجة النتيجة
-        if (returnCode === 0) {
-            // نجاح العملية
-            
-            // قراءة تكلفة الشراء من النتيجة لتسجيلها في السجلات (الـ SP يعيد جدولاً فيه ItemCash)
-            // ملاحظة: الـ SP يحسب السعر بناءً على T_ItemInfo وليس Web_Shop
-            const record = result.recordset && result.recordset.length > 0 ? result.recordset[0] : {};
-            const cost = record.ItemCash || 0;
-
-            // تسجيل العملية في Web_EconomyLog للمراقبة
-            await pool.request()
-                .input('u', userNo)
-                .input('amt', cost)
-                .input('desc', `Shop Buy: ${item.ItemName} (SP)`)
+        try {
+            // أ. جلب بيانات السعر من Web_Shop (شرطك الأساسي)
+            // وجلب بيانات "T_ItemInfo" لمحاكاة الـ SP (ItemType, UseType, etc)
+            const shopItemQuery = await transaction.request()
+                .input('sid', shopId)
                 .query(`
-                    INSERT INTO AdrenalineWeb.dbo.Web_EconomyLog 
-                    (UserNo, ActionType, Amount, Currency, Description, LogDate)
-                    VALUES (@u, 'SHOP_BUY', @amt, 'CASH', @desc, GETDATE())
+                    SELECT 
+                        -- بيانات المتجر (السعر والمدة)
+                        S.ShopID, S.ItemID, S.PriceGP, S.Duration, 
+                        
+                        -- بيانات اللعبة (للمحاكاة الدقيقة للـ SP)
+                        I.ItemName, 
+                        I.ItemType, 
+                        I.IsBaseItem, 
+                        I.IsGrenade, 
+                        I.NeedSlot, 
+                        I.RestrictLevel, 
+                        I.UseType
+                    FROM AdrenalineWeb.dbo.Web_Shop S
+                    INNER JOIN GameDB.dbo.T_ItemInfo I ON S.ItemID = I.ItemId
+                    WHERE S.ShopID = @sid AND S.IsActive = 1
                 `);
 
-            res.json({ status: 'success', message: `تم شراء ${item.ItemName} بنجاح` });
-        } else if (returnCode === 1) {
-            res.status(400).json({ message: 'رصيد الكاش غير كافٍ لإتمام العملية' });
-        } else {
-            res.status(500).json({ message: 'فشلت عملية الشراء لسبب غير معروف' });
+            if (shopItemQuery.recordset.length === 0) throw new Error('العنصر غير موجود أو تم حذفه');
+            const item = shopItemQuery.recordset[0];
+
+            // ب. فحص رصيد اللاعب
+            // (بما أننا نستخدم PriceGP، فالعملة هي GameMoney أي الذهب)
+            const userWallet = await transaction.request()
+                .input('uid', userNo)
+                .query("SELECT GameMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid");
+
+            if (userWallet.recordset.length === 0) throw new Error('حساب اللاعب غير موجود');
+
+            const currentMoney = userWallet.recordset[0].GameMoney;
+
+            if (currentMoney < item.PriceGP) {
+                throw new Error(`رصيدك غير كافٍ. تحتاج ${item.PriceGP} GP`);
+            }
+
+            // ج. خصم المبلغ (تحديث الرصيد)
+            await transaction.request()
+                .input('price', item.PriceGP)
+                .input('uid', userNo)
+                .query("UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney - @price WHERE UserNo = @uid");
+
+            // د. إضافة العنصر (Insert يحاكي sp_BuyItem تماماً)
+            
+            // 1. حساب تاريخ الانتهاء
+            const endDateQuery = item.Duration > 0 
+                ? `DATEADD(DAY, ${item.Duration}, GETDATE())` 
+                : `'2099-01-01'`; 
+
+            // 2. منطق الختم (SealVal)
+            // حسب الـ SP: إذا كان الشراء بالذهب (UseGamePoint=1) فإن SealVal = 0
+            // بما أننا نبيع بـ GP، فالقيمة 0. لو كنا نبيع بـ Cash، تكون 1.
+            const sealVal = 0; 
+
+            // 3. القيم الافتراضية (ISNULL كما في الـ SP)
+            const itemType = item.ItemType || 0;
+            const isBaseItem = item.IsBaseItem || 0;
+            const isGrenade = item.IsGrenade || 0;
+            const needSlot = item.NeedSlot || 0;
+            const restrictLevel = item.RestrictLevel || 0;
+            const useType = item.UseType || 0;
+
+            await transaction.request()
+                .input('uid', userNo)
+                .input('iid', item.ItemID)
+                .input('itype', itemType)
+                .input('isbase', isBaseItem)
+                .input('isgrenade', isGrenade)
+                .input('slot', needSlot)
+                .input('level', restrictLevel)
+                .input('usetype', useType)
+                .input('seal', sealVal)
+                .query(`
+                    INSERT INTO GameDB.dbo.T_UserItem 
+                    (
+                        UserNo, ItemId, ItemType, IsBaseItem, Count, Status, 
+                        StartDate, EndDate, 
+                        IsGrenade, NeedSlot, IsPcBangItem, RestrictLevel, UseType, SealVal
+                    )
+                    VALUES 
+                    (
+                        @uid, @iid, @itype, @isbase, 1, 1, 
+                        GETDATE(), ${endDateQuery}, 
+                        @isgrenade, @slot, 0, @level, @usetype, @seal
+                    )
+                `);
+
+            // هـ. تسجيل العملية (Web_EconomyLog)
+            try {
+                await transaction.request()
+                    .input('uid', userNo)
+                    .input('price', item.PriceGP)
+                    .input('item', item.ItemName)
+                    .query(`
+                        INSERT INTO AdrenalineWeb.dbo.Web_EconomyLog 
+                        (UserNo, ActionType, Amount, Currency, Description, LogDate)
+                        VALUES (@uid, 'SHOP_BUY', @price, 'GP', @item, GETDATE())
+                    `);
+            } catch (e) { /* تجاهل أخطاء السجل */ }
+
+            // إتمام العملية
+            await transaction.commit();
+            res.json({ status: 'success', message: `تم شراء ${item.ItemName} بنجاح!` });
+
+        } catch (err) {
+            await transaction.rollback();
+            const msg = err.message.includes('رصيد') || err.message.includes('ممتلئة') 
+                ? err.message 
+                : 'فشل عملية الشراء';
+            res.status(400).json({ message: msg });
         }
 
     } catch (err) {
         console.error('Buy Error:', err);
-        res.status(500).json({ message: 'حدث خطأ في السيرفر أثناء الشراء' });
+        res.status(500).json({ message: 'حدث خطأ في السيرفر' });
     }
 };

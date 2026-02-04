@@ -58,8 +58,9 @@ app.use('/api/paypal', paypalRoutes);
 app.use('/api/tickets', require('./routes/ticketRoutes'));
 app.use('/public', express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
-
+app.use('/public', express.static(path.join(__dirname, 'public')));
 // 3. فحص السيرفر
+
 app.get('/', (req, res) => {
     res.json({ message: 'Server is running perfectly!' });
 });

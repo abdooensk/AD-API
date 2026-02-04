@@ -97,6 +97,7 @@ exports.searchItems = async (req, res) => {
 };
 
 // 2. إضافة عنصر للمتجر (مع التحقق من المدة)
+// 2. إضافة عنصر للمتجر (مصحح: يضيف اسم العنصر لتجنب خطأ NULL)
 exports.addItemToShop = async (req, res) => {
     const { itemId, price, duration, isHot, isNew } = req.body;
 
@@ -108,28 +109,37 @@ exports.addItemToShop = async (req, res) => {
     try {
         const pool = await poolPromise;
         
-        // جلب المعلومات الأصلية من T_ItemInfo لتحديد الفئة
-        const itemCheck = await pool.request().input('id', itemId).query("SELECT ItemType, IsGrenade, NeedSlot, RestrictLevel FROM GameDB.dbo.T_ItemInfo WHERE ItemId = @id");
+        // 1. جلب المعلومات (أضفنا ItemName هنا) 👇
+        const itemCheck = await pool.request()
+            .input('id', itemId)
+            .query("SELECT ItemName, ItemType, IsGrenade, NeedSlot, RestrictLevel FROM GameDB.dbo.T_ItemInfo WHERE ItemId = @id");
         
         if (itemCheck.recordset.length === 0) return res.status(404).json({ message: 'العنصر غير موجود في ملفات اللعبة' });
         
-        const analysis = analyzeItem(itemCheck.recordset[0]);
+        const itemInfo = itemCheck.recordset[0];
+        const analysis = analyzeItem(itemInfo);
 
+        // 2. الإدخال مع اسم العنصر
         await pool.request()
             .input('id', itemId)
+            .input('name', itemInfo.ItemName) // 👈 إرسال الاسم
             .input('price', price)
             .input('days', duration)
-            .input('cat', analysis.category) // الفئة تحدد تلقائياً (WEAPON, GEAR, CHARACTER...)
+            .input('cat', analysis.category)
             .input('hot', isHot ? 1 : 0)
             .input('new', isNew ? 1 : 0)
             .query(`
                 INSERT INTO AdrenalineWeb.dbo.Web_Shop 
-                (ItemID, PriceGP, Duration, Category, IsHot, IsNew, IsActive)
-                VALUES (@id, @price, @days, @cat, @hot, @new, 1)
+                (ItemID, ItemName, PriceGP, Duration, Category, IsHot, IsNew, IsActive)
+                VALUES (@id, @name, @price, @days, @cat, @hot, @new, 1)
             `);
 
         res.json({ status: 'success', message: 'تمت الإضافة بنجاح' });
-    } catch (err) { res.status(500).json({ message: 'فشل الإضافة' }); }
+
+    } catch (err) { 
+        console.error("Shop Add Error:", err);
+        res.status(500).json({ message: 'فشل الإضافة', error: err.message }); 
+    }
 };
 
 // 3. تعديل عنصر (السعر/المدة/الحالة)
@@ -159,13 +169,45 @@ exports.updateShopItem = async (req, res) => {
 };
 
 // 4. حذف (إخفاء)
-exports.removeFromShop = async (req, res) => {
+// 4. حذف عنصر من المتجر نهائياً (Hard Delete)
+exports.removeShopItem = async (req, res) => { // لاحظ تغيير الاسم ليتطابق مع الروابط
     const { shopId } = req.params;
+    const adminId = req.user.userId; // نحتاج هذا للتسجيل
+
     try {
         const pool = await poolPromise;
-        await pool.request().input('sid', shopId).query("UPDATE AdrenalineWeb.dbo.Web_Shop SET IsActive = 0 WHERE ShopID = @sid");
-        res.json({ status: 'success', message: 'تم الحذف' });
-    } catch (err) { res.status(500).json({ message: 'فشل الحذف' }); }
+
+        // 1. نجلب اسم العنصر أولاً (لأجل السجل - Log)
+        const check = await pool.request()
+            .input('sid', shopId)
+            .query("SELECT ItemName, ItemID FROM AdrenalineWeb.dbo.Web_Shop WHERE ShopID = @sid");
+
+        if (check.recordset.length === 0) {
+            return res.status(404).json({ message: 'العنصر غير موجود' });
+        }
+
+        const { ItemName, ItemID } = check.recordset[0];
+
+        // 2. الحذف النهائي من الجدول
+        await pool.request()
+            .input('sid', shopId)
+            .query("DELETE FROM AdrenalineWeb.dbo.Web_Shop WHERE ShopID = @sid");
+
+        // 3. تسجيل العملية (اختياري لكن مفضل)
+        try {
+            await pool.request()
+                .input('admin', adminId)
+                .input('action', 'SHOP_REMOVE')
+                .input('details', `Deleted ${ItemName} (ID: ${ItemID})`)
+                .query("INSERT INTO AdrenalineWeb.dbo.Web_AdminLog (AdminID, Action, Details) VALUES (@admin, @action, @details)");
+        } catch (e) { console.log('Log Error ignored'); }
+
+        res.json({ status: 'success', message: 'تم حذف العنصر نهائياً' });
+
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ message: 'فشل الحذف' }); 
+    }
 };
 
 // 5. عرض قائمة المتجر للأدمن (مع JOIN لجلب الأسماء)
