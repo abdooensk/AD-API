@@ -1,6 +1,5 @@
 const { poolPromise, sql } = require('../config/db');
-const bcrypt = require('bcryptjs'); // 👈 إضافة هامة جداً
-// ==========================================
+const crypto = require('crypto'); // ✅ صحيح: لأننا نستخدم crypto.createHash في الأسفل// ==========================================
 // 1. نظام "الجاسوس" وكشف التعدد (Multi-Account)
 // ==========================================
 exports.getMultiAccounts = async (req, res) => {
@@ -287,45 +286,51 @@ exports.clearAnnouncements = async (req, res) => {
 // ==========================================
 // 7. حظر الآي بي (IP Ban) - العقوبة القصوى
 // ==========================================
+// ==========================================
+// 7. حظر الآي بي (IP Ban) - العقوبة القصوى
+// ==========================================
 exports.banIP = async (req, res) => {
-    const { ipAddress, days } = req.body; // الآي بي + عدد الأيام
+    const { ipAddress } = req.body; 
     const adminId = req.user.userId;
 
     if (!ipAddress) return res.status(400).json({ message: 'يجب تحديد عنوان IP' });
 
+    // دالة مساعدة لتحويل IP (x.x.x.x) إلى رقم صحيح (BigInt/Int)
+    // هذا ضروري لأن جدول T_IpFilterInfo يخزن IPs كأرقام
+    const ipToLong = (ip) => {
+        return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet, 10), 0) >>> 0;
+    };
+
     try {
         const pool = await poolPromise;
+        const ipNum = ipToLong(ipAddress); // تحويل العنوان إلى رقم
 
-        // تحويل الـ IP من نص (String) إلى رقم (BigInt) إذا كان الجدول يتطلب ذلك
-        // ملاحظة: جدول T_IpFilterInfo في ملفاتك يستخدم BigInt للـ StartIp و EndIp
-        // لكن للتبسيط، سأفترض أنك ستستخدم دالة SQL لتحويل الـ IP أو تدخله كنص إذا عدلت الجدول.
-        // الكود أدناه يتعامل مع السيناريو الأسهل (إدخال مباشر إذا كان الجدول يدعم varchar أو التحويل).
-        
-        /* تنبيه: جداول اللعبة الأصلية تخزن الـ IP كـ أرقام (INET_ATON).
-           إذا كانت لديك دالة SQL للتحويل استخدمها، وإلا سنستخدم معادلة بسيطة في JS.
-        */
-        
-        // دالة مساعدة لتحويل IP إلى رقم (IPv4)
-        const ipToLong = (ip) => {
-            return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet, 10), 0) >>> 0;
-        };
+        // 1. التحقق: هل هذا الـ IP محظور بالفعل؟
+        const checkBan = await pool.request()
+            .input('ipVal', ipNum)
+            .query("SELECT Id FROM GameDB.dbo.T_IpFilterInfo WHERE StartIp = @ipVal AND EndIp = @ipVal");
 
-        const ipNum = ipToLong(ipAddress);
+        if (checkBan.recordset.length > 0) {
+            return res.status(400).json({ message: 'هذا العنوان محظور بالفعل!' });
+        }
 
+        // 2. تنفيذ الحظر
+        // Type = 1 (عادة يعني Ban/Block في ملفات GunZ)
+        // نضع StartIp و EndIp نفس القيمة لحظره هو فقط
         await pool.request()
             .input('ipVal', ipNum)
             .query(`
                 INSERT INTO GameDB.dbo.T_IpFilterInfo (Type, StartIp, EndIp, Count)
                 VALUES (1, @ipVal, @ipVal, 1) 
             `); 
-            // Type 1 = Block/Ban, Count = ? (قد يكون عداد المحاولات أو غيره، عادة 1 يكفي)
 
-        await logAdminAction(adminId, 'IP_BAN', `Banned IP: ${ipAddress}`);
+        // 3. تسجيل العملية
+        await logAdminAction(adminId, 'IP_BAN', `Banned IP: ${ipAddress} (Val: ${ipNum})`);
 
         res.json({ status: 'success', message: `تم حظر العنوان ${ipAddress} بنجاح` });
 
     } catch (err) {
-        console.error(err);
+        console.error("IP Ban Error:", err);
         res.status(500).json({ message: 'فشل حظر الـ IP' });
     }
 };
@@ -515,6 +520,65 @@ exports.unbanPlayer = async (req, res) => {
 // ==========================================
 // 14. تغيير كلمة مرور المستخدم (Admin Force Change)
 // ==========================================
+// ==========================================
+// 8. إدارة قائمة الآي بي المحظور (List & Unban IPs)
+// ==========================================
+
+// أ. جلب قائمة المحظورين
+exports.getBannedIPs = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        // نجلب كل القائمة من جدول الفلتر
+        const result = await pool.request().query("SELECT Id, StartIp, EndIp, Type, Count FROM GameDB.dbo.T_IpFilterInfo");
+
+        // دالة مساعدة لتحويل الرقم (Long) إلى نص (IPv4)
+        // لأن قاعدة البيانات تخزنه كرقم لا يمكن قراءته بسهولة
+        const longToIp = (long) => {
+            return [
+                (long >>> 24) & 0xFF,
+                (long >>> 16) & 0xFF,
+                (long >>> 8) & 0xFF,
+                long & 0xFF
+            ].join('.');
+        };
+
+        // تنسيق البيانات قبل إرسالها للواجهة
+        const bans = result.recordset.map(ban => ({
+            id: ban.Id,
+            ip: longToIp(ban.StartIp), // نعرض StartIp لأنه في الغالب هو نفسه EndIp عند حظر فردي
+            rawStart: ban.StartIp,
+            rawEnd: ban.EndIp,
+            type: ban.Type
+        }));
+
+        res.json({ status: 'success', bans });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل جلب قائمة الحظر' });
+    }
+};
+
+// ب. فك حظر آي بي (حذفه من القائمة)
+exports.deleteBannedIP = async (req, res) => {
+    const { id } = req.params; // نستخدم الـ ID الخاص بالسطر في الجدول
+
+    if (!id) return res.status(400).json({ message: 'يجب تحديد رقم الحظر (ID)' });
+
+    try {
+        const pool = await poolPromise;
+        
+        await pool.request()
+            .input('id', id)
+            .query("DELETE FROM GameDB.dbo.T_IpFilterInfo WHERE Id = @id");
+
+        res.json({ status: 'success', message: 'تم رفع الحظر عن العنوان بنجاح' });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل عملية فك الحظر' });
+    }
+};
 exports.changeUserPassword = async (req, res) => {
     const { targetUserNo, newPassword } = req.body;
     const adminId = req.user.userId;
@@ -684,6 +748,226 @@ exports.chargePlayerBalance = async (req, res) => {
     } catch (err) {
         console.error("Charge Error:", err);
         res.status(500).json({ message: 'فشل عملية الشحن' });
+    }
+};
+// ==========================================
+// 6-A. عرض الإشعارات الحالية (Get Active Announcements)
+// ==========================================
+exports.getAnnouncements = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        // نجلب الإشعارات التي لم ينتهِ وقتها بعد
+        const result = await pool.request().query(`
+            SELECT SeqNo, Notice, StartDate, EndDate, Interval 
+            FROM GameDB.dbo.NoticeInfo 
+            WHERE EndDate > GETDATE()
+            ORDER BY StartDate DESC
+        `);
+
+        res.json({ status: 'success', notices: result.recordset });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل جلب الإشعارات' });
+    }
+};
+
+// ==========================================
+// 6-B. تعديل إشعار محدد (Update Specific Announcement)
+// ==========================================
+exports.updateAnnouncement = async (req, res) => {
+    const { id } = req.params; // SeqNo
+    const { message, minutes } = req.body;
+
+    if (!id || !message) {
+        return res.status(400).json({ message: 'البيانات ناقصة (ID, Message)' });
+    }
+
+    try {
+        const pool = await poolPromise;
+        
+        // إذا تم إرسال دقائق جديدة، نعيد حساب وقت النهاية
+        let updateQuery = "UPDATE GameDB.dbo.NoticeInfo SET Notice = @msg";
+        
+        if (minutes) {
+            updateQuery += ", EndDate = DATEADD(MINUTE, @mins, GETDATE())";
+        }
+        
+        updateQuery += " WHERE SeqNo = @id";
+
+        const request = pool.request()
+            .input('id', id)
+            .input('msg', message);
+            
+        if (minutes) request.input('mins', minutes);
+
+        await request.query(updateQuery);
+
+        res.json({ status: 'success', message: 'تم تعديل الإشعار بنجاح' });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل تعديل الإشعار' });
+    }
+};
+
+// ==========================================
+// 6-C. حذف إشعار محدد (Delete Specific Announcement)
+// ==========================================
+exports.deleteAnnouncement = async (req, res) => {
+    const { id } = req.params;
+
+    if (!id) return res.status(400).json({ message: 'رقم الإشعار مطلوب' });
+
+    try {
+        const pool = await poolPromise;
+        await pool.request()
+            .input('id', id)
+            .query("DELETE FROM GameDB.dbo.NoticeInfo WHERE SeqNo = @id");
+
+        res.json({ status: 'success', message: 'تم حذف الإشعار' });
+    } catch (err) {
+        res.status(500).json({ message: 'فشل الحذف' });
+    }
+};
+// ==========================================
+// 17. إدارة أحداث السيرفر (Server Events & Rates)
+// ==========================================
+
+// أ. جلب إعدادات الإيفنت الحالية
+exports.getEventConfig = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        // نجلب السطر الأول فقط لأن إعدادات السيرفر تكون في سطر واحد
+        const result = await pool.request().query(`
+            SELECT TOP 1 
+                EventExp, 
+                EventMoney, 
+                ClanWarPoint, 
+                DisguiseEvent
+            FROM GameDB.dbo.T_ServerConfig
+        `);
+        
+        if (result.recordset.length === 0) {
+            // إنشاء إعدادات افتراضية إذا كان الجدول فارغاً
+            await pool.request().query("INSERT INTO GameDB.dbo.T_ServerConfig (EventExp, EventMoney, ClanWarPoint, DisguiseEvent, PcBang1PlayExp, PcBang2PlayExp, PcBang1PlayGameMoney, PcBang2PlayGameMoney) VALUES (100, 100, 0, 0, 100, 100, 100, 100)");
+            return res.json({ status: 'success', config: { EventExp: 100, EventMoney: 100, ClanWarPoint: 0, DisguiseEvent: 0 } });
+        }
+
+        res.json({ status: 'success', config: result.recordset[0] });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل جلب إعدادات الإيفنت' });
+    }
+};
+
+// ب. تحديث إعدادات الإيفنت (XP, Money, Clan Points)
+exports.updateEventConfig = async (req, res) => {
+    const { eventExp, eventMoney, clanPoint, disguise } = req.body;
+    const adminId = req.user.userId;
+
+    try {
+        const pool = await poolPromise;
+        
+        // استخدام UPDATE بدون WHERE لأنه يوجد سطر واحد فقط
+        await pool.request()
+            .input('exp', eventExp || 100)
+            .input('money', eventMoney || 100)
+            .input('clan', clanPoint || 0)
+            .input('disguise', disguise || 0)
+            .query(`
+                UPDATE GameDB.dbo.T_ServerConfig 
+                SET EventExp = @exp, 
+                    EventMoney = @money, 
+                    ClanWarPoint = @clan,
+                    DisguiseEvent = @disguise
+            `);
+
+        // تسجيل العملية
+        await logAdminAction(adminId, 'UPDATE_EVENT', `Rates: XP ${eventExp}%, Money ${eventMoney}%`);
+
+        res.json({ status: 'success', message: 'تم تحديث إعدادات الإيفنت بنجاح' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل تحديث الإيفنت' });
+    }
+};
+
+// ==========================================
+// 18. إدارة جوائز الحضور (Attendance Event)
+// ==========================================
+
+// أ. جلب قائمة الجوائز
+exports.getAttendanceRewards = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request().query(`
+            SELECT A.DayCount, A.ItemId, A.ItemDays, A.ItemCount, I.ItemName
+            FROM GameDB.dbo.T_Event_Attendance A
+            LEFT JOIN GameDB.dbo.T_ItemInfo I ON A.ItemId = I.ItemId
+            ORDER BY A.DayCount ASC
+        `);
+        res.json({ status: 'success', rewards: result.recordset });
+    } catch (err) {
+        res.status(500).json({ message: 'فشل جلب جوائز الحضور' });
+    }
+};
+
+// ب. إضافة أو تعديل جائزة ليوم معين
+exports.setAttendanceReward = async (req, res) => {
+    const { dayCount, itemId, days, count } = req.body; // اليوم، رقم الأداة، المدة، العدد
+
+    if (!dayCount || !itemId) return res.status(400).json({ message: 'بيانات ناقصة' });
+
+    try {
+        const pool = await poolPromise;
+        
+        // التحقق أولاً: هل يوجد جائزة لهذا اليوم؟
+        const check = await pool.request()
+            .input('day', dayCount)
+            .query("SELECT DayCount FROM GameDB.dbo.T_Event_Attendance WHERE DayCount = @day");
+
+        if (check.recordset.length > 0) {
+            // تحديث (Update)
+            await pool.request()
+                .input('day', dayCount)
+                .input('id', itemId)
+                .input('days', days || 0)
+                .input('count', count || 1)
+                .query(`
+                    UPDATE GameDB.dbo.T_Event_Attendance 
+                    SET ItemId = @id, ItemDays = @days, ItemCount = @count
+                    WHERE DayCount = @day
+                `);
+        } else {
+            // إضافة جديد (Insert)
+            await pool.request()
+                .input('day', dayCount)
+                .input('id', itemId)
+                .input('days', days || 0)
+                .input('count', count || 1)
+                .query(`
+                    INSERT INTO GameDB.dbo.T_Event_Attendance (DayCount, ItemId, ItemDays, ItemCount, Name)
+                    VALUES (@day, @id, @days, @count, 'Reward')
+                `);
+        }
+
+        res.json({ status: 'success', message: `تم حفظ جائزة اليوم ${dayCount}` });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل حفظ الجائزة' });
+    }
+};
+
+// ج. حذف جائزة يوم
+exports.deleteAttendanceReward = async (req, res) => {
+    const { dayCount } = req.params;
+    try {
+        const pool = await poolPromise;
+        await pool.request().input('day', dayCount).query("DELETE FROM GameDB.dbo.T_Event_Attendance WHERE DayCount = @day");
+        res.json({ status: 'success', message: 'تم حذف الجائزة' });
+    } catch (err) {
+        res.status(500).json({ message: 'فشل الحذف' });
     }
 };
 // دالة مساعدة للتسجيل (تأكد أنها موجودة أو مستوردة)

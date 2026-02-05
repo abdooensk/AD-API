@@ -1,56 +1,94 @@
 const { poolPromise, sql } = require('../config/db');
-const { v4: uuidv4 } = require('uuid');
 
 // --- دوال مساعدة ---
-const generateSegment = (length) => {
+
+// 1. توليد كود رقمي بالشكل المطلوب (123456-123456-1234)
+const generateNumericSerial = () => {
     const chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    let result = '';
-    for (let i = 0; i < length; i++) {
-        result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
+    const gen = (len) => {
+        let res = '';
+        for (let i = 0; i < len; i++) {
+            res += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        return res;
+    };
+    // النتيجة: 6 رموز - 6 رموز - 4 رموز (أحرف وأرقام)
+    return `${gen(6)}-${gen(6)}-${gen(4)}`;
 };
 
-// تحويل القيمة لـ NULL إذا كانت 0 (لتوافق SQL)
+// 2. تحويل القيم لـ NULL إذا كانت 0
 const toSqlVal = (val) => (val && val > 0) ? val : 'NULL';
 
+// 3. حل مشكلة UserID (الاسم) وتحويله لـ UserNo (الرقم) لضمان عدم حدوث خطأ Conversion
+async function resolveUserNo(req, pool) {
+    if (req.user.userNo && !isNaN(req.user.userNo)) {
+        return req.user.userNo;
+    }
+    const userIdentifier = req.user.userId;
+    if (userIdentifier) {
+        const check = await pool.request()
+            .input('loginId', userIdentifier)
+            .query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE UserId = @loginId");
+        
+        if (check.recordset.length > 0) {
+            return check.recordset[0].UserNo;
+        }
+    }
+    throw new Error('UserNo not found for this account');
+}
+
 // =========================================================
-// 1. عرض القسائم المميزة في المتجر
+// 1. عرض المتجر (جلب كل العناصر مع أسمائها)
 // =========================================================
 exports.getShopBundles = async (req, res) => {
     try {
         const pool = await poolPromise;
         const result = await pool.request().query(`
             SELECT 
-                CouponID AS BundleID, -- نعيد تسميتها BundleID لتوافق الفرونت إند القديم إذا وجد
-                Title AS BundleName, 
-                Description, 
-                PriceGP, 
-                PublicFeeGP, 
-                ImageURL, -- 👈 الصورة الجديدة
-                ItemId1, ItemDays1, ItemId2, ItemDays2, ItemId3, ItemDays3
-                -- يمكنك جلب باقي العناصر إذا أردت عرضها بالتفصيل
-            FROM AdrenalineWeb.dbo.Web_PremiumCoupons 
-            WHERE IsActive = 1
-            ORDER BY CouponID DESC
+                C.CouponID AS BundleID, C.Title AS BundleName, C.Description, 
+                C.PriceGP, C.PublicFeeGP, C.ImageURL,
+                
+                -- جلب معرفات العناصر وأسمائها وعدد أيامها (9 عناصر)
+                C.ItemId1, C.ItemDays1, I1.ItemName AS ItemName1,
+                C.ItemId2, C.ItemDays2, I2.ItemName AS ItemName2,
+                C.ItemId3, C.ItemDays3, I3.ItemName AS ItemName3,
+                C.ItemId4, C.ItemDays4, I4.ItemName AS ItemName4,
+                C.ItemId5, C.ItemDays5, I5.ItemName AS ItemName5,
+                C.ItemId6, C.ItemDays6, I6.ItemName AS ItemName6,
+                C.ItemId7, C.ItemDays7, I7.ItemName AS ItemName7,
+                C.ItemId8, C.ItemDays8, I8.ItemName AS ItemName8,
+                C.ItemId9, C.ItemDays9, I9.ItemName AS ItemName9
+
+            FROM AdrenalineWeb.dbo.Web_PremiumCoupons C
+            LEFT JOIN GameDB.dbo.T_ItemInfo I1 ON C.ItemId1 = I1.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I2 ON C.ItemId2 = I2.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I3 ON C.ItemId3 = I3.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I4 ON C.ItemId4 = I4.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I5 ON C.ItemId5 = I5.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I6 ON C.ItemId6 = I6.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I7 ON C.ItemId7 = I7.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I8 ON C.ItemId8 = I8.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I9 ON C.ItemId9 = I9.ItemId
+            
+            WHERE C.IsActive = 1
+            ORDER BY C.CouponID DESC
         `);
         res.json({ status: 'success', bundles: result.recordset });
     } catch (err) {
-        res.status(500).json({ message: 'خطأ في جلب القسائم', error: err.message });
+        res.status(500).json({ status: 'error', message: 'خطأ في جلب القسائم', error: err.message });
     }
 };
 
 // =========================================================
-// 2. شراء القسيمة وتوليد الكود
+// 2. شراء القسيمة وتوليد الكود الرقمي
 // =========================================================
 exports.buyBundle = async (req, res) => {
-    const { bundleId, makePublic } = req.body; // bundleId هنا هو CouponID
-    const userNo = req.user.userId; // تأكد من استخدام userId أو userNo حسب الميدل وير
-
+    const { bundleId, makePublic } = req.body;
+    
     try {
         const pool = await poolPromise;
+        const userNo = await resolveUserNo(req, pool);
 
-        // أ. جلب بيانات القسيمة من الجدول الجديد
         const bundleRes = await pool.request()
             .input('bid', bundleId)
             .query("SELECT * FROM AdrenalineWeb.dbo.Web_PremiumCoupons WHERE CouponID = @bid AND IsActive = 1");
@@ -58,63 +96,45 @@ exports.buyBundle = async (req, res) => {
         const bundle = bundleRes.recordset[0];
         if (!bundle) return res.status(404).json({ message: 'القسيمة غير موجودة' });
 
-        // ب. حساب السعر النهائي (سعر القسيمة + رسوم النشر إذا اختار ذلك)
         let finalPrice = bundle.PriceGP;
         if (makePublic) finalPrice += (bundle.PublicFeeGP || 0);
 
-        // ج. التحقق من رصيد اللاعب
         const userCheck = await pool.request()
             .input('uid', userNo)
             .query("SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid");
             
-        if (userCheck.recordset[0].CashMoney < finalPrice) {
-            return res.status(400).json({ message: `رصيدك غير كافٍ. المطلوب: ${finalPrice} Cash` });
+        if (!userCheck.recordset[0] || userCheck.recordset[0].CashMoney < finalPrice) {
+            return res.status(400).json({ message: 'رصيدك غير كافٍ' });
         }
 
-        // د. بدء المعاملة المالية
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
 
         try {
             const request = new sql.Request(transaction);
-            
-            // توليد سيريال فريد (XXXXXX-XXXXXX-XXXX)
-            const newSerial = `${generateSegment(6)}-${generateSegment(6)}-${generateSegment(4)}`;
-            
-            // تحديد مالك الكود: إذا كان عاماً (Public) فالمالك NULL، وإلا فهو المشتري
+            const newSerial = generateNumericSerial(); // توليد الكود الرقمي 123456-123456-1234
             const targetUserSql = makePublic ? 'NULL' : userNo; 
 
-            // إعداد القيم
             request.input('price', finalPrice);
             request.input('uid', userNo);
             request.input('serial', newSerial);
             request.input('bid', bundleId);
             request.input('isPub', makePublic ? 1 : 0);
 
-            // 1. خصم المال
-            const deduct = await request.query(`
-                UPDATE GameDB.dbo.T_User 
-                SET CashMoney = CashMoney - @price 
-                WHERE UserNo = @uid AND CashMoney >= @price
-            `);
+            await request.query("UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @price WHERE UserNo = @uid");
 
-            if (deduct.rowsAffected[0] === 0) {
-                throw new Error("رصيد غير كافٍ أو خطأ في الخصم");
-            }
-
-            // 2. إدخال الكود في جدول اللعبة (T_ItemSerialKey)
-            // نستخدم القيم من جدول Web_PremiumCoupons
             await request.query(`
                 INSERT INTO GameDB.dbo.T_ItemSerialKey 
                 (
                     SerialKey, TargetUserNo, OneTimeKey, RegDate, ExpireDate, SupplyGameMoney,
                     SupplyItemId1, SupplyItemDays1, SupplyItemId2, SupplyItemDays2, SupplyItemId3, SupplyItemDays3,
                     SupplyItemId4, SupplyItemDays4, SupplyItemId5, SupplyItemDays5, SupplyItemId6, SupplyItemDays6,
-                    SupplyItemId7, SupplyItemDays7, SupplyItemId8, SupplyItemDays8, SupplyItemId9, SupplyItemDays9
+                    SupplyItemId7, SupplyItemDays7, SupplyItemId8, SupplyItemDays8, SupplyItemId9, SupplyItemDays9,
+                    Description
                 )
                 VALUES 
                 (
-                    @serial, ${targetUserSql}, 1, GETDATE(), DATEADD(YEAR, 1, GETDATE()), 0, -- 0 لأن القسائم عادة عناصر فقط
+                    @serial, ${targetUserSql}, 1, GETDATE(), DATEADD(YEAR, 1, GETDATE()), 0,
                     ${toSqlVal(bundle.ItemId1)}, ${toSqlVal(bundle.ItemDays1)}, 
                     ${toSqlVal(bundle.ItemId2)}, ${toSqlVal(bundle.ItemDays2)}, 
                     ${toSqlVal(bundle.ItemId3)}, ${toSqlVal(bundle.ItemDays3)},
@@ -123,23 +143,19 @@ exports.buyBundle = async (req, res) => {
                     ${toSqlVal(bundle.ItemId6)}, ${toSqlVal(bundle.ItemDays6)},
                     ${toSqlVal(bundle.ItemId7)}, ${toSqlVal(bundle.ItemDays7)}, 
                     ${toSqlVal(bundle.ItemId8)}, ${toSqlVal(bundle.ItemDays8)}, 
-                    ${toSqlVal(bundle.ItemId9)}, ${toSqlVal(bundle.ItemDays9)}
+                    ${toSqlVal(bundle.ItemId9)}, ${toSqlVal(bundle.ItemDays9)},
+                    'Web Purchase'
                 )
             `);
 
-            // 3. تسجيل القسيمة في الويب (للمحفظة الشخصية)
-            // ملاحظة: تأكد من وجود جدول Web_UserCoupons في قاعدة AdrenalineWeb
             await request.query(`
                 INSERT INTO AdrenalineWeb.dbo.Web_UserCoupons (UserNo, SerialKey, BundleID, IsPublic)
                 VALUES (@uid, @serial, @bid, @isPub)
             `);
 
-            // 4. تسجيل العملية في سجلات الاقتصاد (مهم جداً)
-            request.input('desc', `Bought Premium Coupon: ${bundle.Title} (${newSerial})`);
             await request.query(`
-                INSERT INTO AdrenalineWeb.dbo.Web_EconomyLog 
-                (UserNo, ActionType, Amount, Currency, Description, LogDate)
-                VALUES (@uid, 'COUPON_BUY', @price, 'CASH', @desc, GETDATE())
+                INSERT INTO AdrenalineWeb.dbo.Web_EconomyLog (UserNo, ActionType, Amount, Currency, Description, LogDate)
+                VALUES (@uid, 'COUPON_BUY', @price, 'CASH', 'Bought Coupon Bundle', GETDATE())
             `);
 
             await transaction.commit();
@@ -151,106 +167,59 @@ exports.buyBundle = async (req, res) => {
         }
 
     } catch (err) {
-        console.error('Buy Bundle Error:', err);
-        res.status(500).json({ message: 'فشلت عملية الشراء', error: err.message });
+        res.status(500).json({ status: 'error', message: 'فشلت عملية الشراء', error: err.message });
     }
 };
 
 // =========================================================
-// 3. استخدام الكوبون (Redeem) - (بقي كما هو تقريباً لأنه يعتمد على جدول اللعبة)
+// 3. عرض كوبوناتي (جلب أرقام وأسماء كل العناصر)
 // =========================================================
-exports.redeemCoupon = async (req, res) => {
-    const { serial } = req.body;
-    const userNo = req.user.userId;
-    const cleanSerial = serial ? serial.trim().toUpperCase() : '';
-
-    if (!cleanSerial) return res.status(400).json({ message: 'أدخل الكود' });
-
+exports.getMyCoupons = async (req, res) => {
     try {
         const pool = await poolPromise;
+        const userNo = await resolveUserNo(req, pool);
 
-        // التحقق من الكود
-        const check = await pool.request()
-            .input('key', cleanSerial)
-            .query("SELECT * FROM GameDB.dbo.T_ItemSerialKey WHERE SerialKey = @key");
+        const result = await pool.request().input('uid', userNo).query(`
+            SELECT 
+                UC.SerialKey, UC.IsPublic, UC.PurchaseDate, 
+                B.Title AS BundleName, B.ImageURL,
+                
+                -- العناصر والأسماء
+                B.ItemId1, I1.ItemName AS ItemName1,
+                B.ItemId2, I2.ItemName AS ItemName2,
+                B.ItemId3, I3.ItemName AS ItemName3,
 
-        const coupon = check.recordset[0];
+                ISNULL(K.ExpireDate, DATEADD(YEAR, 1, UC.PurchaseDate)) AS ExpireDate,
+                CASE WHEN Used.SerialKey IS NOT NULL THEN 1 ELSE 0 END AS IsUsed,
+                Used.UsedDate
 
-        if (!coupon) return res.status(404).json({ message: 'الكود غير صحيح' });
-        if (coupon.Status && coupon.Status > 0) return res.status(400).json({ message: 'تم استخدام الكود مسبقاً' });
-        if (coupon.TargetUserNo !== null && coupon.TargetUserNo !== userNo) return res.status(403).json({ message: 'هذا الكود ليس ملكك' });
-        if (new Date(coupon.ExpireDate) < new Date()) return res.status(400).json({ message: 'انتهت صلاحية الكود' });
-
-        // التحقق من سعة الحقيبة (اختياري لكن مفضل)
-        // ...
-
-        const transaction = new sql.Transaction(pool);
-        await transaction.begin();
-
-        try {
-            const req = new sql.Request(transaction);
-            req.input('uid', userNo);
-            req.input('serial', cleanSerial);
-
-            // 1. تحديث الحالة
-            await req.query("UPDATE GameDB.dbo.T_ItemSerialKey SET TargetUserNo = @uid, UseDate = GETDATE(), Status = 2 WHERE SerialKey = @serial");
-
-            // 2. دالة إضافة العناصر
-            const giveItem = async (itemId, days) => {
-                if (itemId && itemId > 0) {
-                    // نحسب تاريخ النهاية
-                    const endDateSql = days > 0 ? `DATEADD(DAY, ${days}, GETDATE())` : `'2099-01-01'`; // دائم
-                    
-                    // نحتاج لمعرفة نوع العنصر من T_ItemInfo ليكون الإدخال دقيقاً
-                    // للتبسيط سنفترض إدخالاً أساسياً، لكن الأفضل عمل JOIN
-                    // هنا سنستخدم أبسط إدخال يقبله السيرفر:
-                    await req.query(`
-                        INSERT INTO GameDB.dbo.T_UserItem 
-                        (UserNo, ItemId, Count, Status, StartDate, EndDate, IsBaseItem, ItemType, IsGrenade, NeedSlot, RestrictLevel)
-                        SELECT @uid, ItemId, 1, 1, GETDATE(), ${endDateSql}, IsBaseItem, ItemType, IsGrenade, NeedSlot, RestrictLevel
-                        FROM GameDB.dbo.T_ItemInfo WHERE ItemId = ${itemId}
-                    `);
-                }
-            };
-
-            // إضافة العناصر الـ 9
-            for (let i = 1; i <= 9; i++) {
-                const id = coupon[`SupplyItemId${i}`];
-                const days = coupon[`SupplyItemDays${i}`];
-                await giveItem(id, days);
-            }
-
-            // إضافة المال إن وجد
-            if (coupon.SupplyGameMoney > 0) {
-                req.input('money', coupon.SupplyGameMoney);
-                await req.query("UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney + @money WHERE UserNo = @uid");
-            }
-
-            await transaction.commit();
-            res.json({ status: 'success', message: 'تم استخدام القسيمة والحصول على الهدايا!' });
-
-        } catch (err) {
-            await transaction.rollback();
-            throw err;
-        }
-
+            FROM AdrenalineWeb.dbo.Web_UserCoupons UC
+            JOIN AdrenalineWeb.dbo.Web_PremiumCoupons B ON UC.BundleID = B.CouponID
+            LEFT JOIN GameDB.dbo.T_ItemInfo I1 ON B.ItemId1 = I1.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I2 ON B.ItemId2 = I2.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemInfo I3 ON B.ItemId3 = I3.ItemId
+            LEFT JOIN GameDB.dbo.T_ItemSerialKey K ON UC.SerialKey = K.SerialKey
+            LEFT JOIN GameDB.dbo.T_ItemSerialKey_Used Used ON UC.SerialKey = Used.SerialKey
+            
+            WHERE UC.UserNo = @uid
+            ORDER BY UC.PurchaseDate DESC
+        `);
+        
+        res.json({ status: 'success', coupons: result.recordset });
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'حدث خطأ أثناء الاستخدام' });
+        res.status(500).json({ status: 'error', message: 'خطأ في جلب الكوبونات', error: err.message });
     }
 };
 
 // =========================================================
-// 4. ترقية الكوبون لعام (للمتاجرة به)
+// 4. ترقية الكوبون لعام
 // =========================================================
 exports.upgradeToPublic = async (req, res) => {
     const { serialKey } = req.body;
-    const userNo = req.user.userId;
-
     try {
         const pool = await poolPromise;
+        const userNo = await resolveUserNo(req, pool);
 
-        // أ. جلب الكوبون مع رسوم الترقية من الجدول الجديد
         const couponRes = await pool.request()
             .input('uid', userNo)
             .input('key', serialKey)
@@ -262,13 +231,11 @@ exports.upgradeToPublic = async (req, res) => {
             `);
         
         const coupon = couponRes.recordset[0];
-
-        if (!coupon) return res.status(404).json({ message: 'الكوبون غير موجود أو لا تملكه' });
+        if (!coupon) return res.status(404).json({ message: 'الكوبون غير موجود' });
         if (coupon.IsPublic) return res.status(400).json({ message: 'الكوبون عام بالفعل' });
         
         const fee = coupon.PublicFeeGP || 0;
 
-        // ب. خصم الرسوم والترقية
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
         try {
@@ -277,51 +244,42 @@ exports.upgradeToPublic = async (req, res) => {
             req.input('fee', fee);
             req.input('key', serialKey);
 
-            // 1. خصم
             if (fee > 0) {
                 const deduct = await req.query("UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @fee WHERE UserNo = @uid AND CashMoney >= @fee");
                 if (deduct.rowsAffected[0] === 0) throw new Error('رصيد غير كافٍ');
             }
 
-            // 2. فك الارتباط
             await req.query("UPDATE GameDB.dbo.T_ItemSerialKey SET TargetUserNo = NULL WHERE SerialKey = @key");
-            
-            // 3. تحديث الويب
             await req.query("UPDATE AdrenalineWeb.dbo.Web_UserCoupons SET IsPublic = 1 WHERE SerialKey = @key");
 
             await transaction.commit();
-            res.json({ status: 'success', message: 'تم تحويل الكوبون إلى عام بنجاح' });
+            res.json({ status: 'success', message: 'تمت الترقية بنجاح' });
 
         } catch (err) {
             await transaction.rollback();
             res.status(400).json({ message: err.message });
         }
-
     } catch (err) {
-        res.status(500).json({ message: 'فشل التحديث' });
+        res.status(500).json({ status: 'error', message: 'فشل التحديث' });
     }
 };
 
 // =========================================================
-// 5. عرض كوبوناتي
+// 5. سجل العمليات
 // =========================================================
-exports.getMyCoupons = async (req, res) => {
-    const userNo = req.user.userId;
+exports.getCouponHistory = async (req, res) => {
     try {
         const pool = await poolPromise;
+        const userNo = await resolveUserNo(req, pool);
+        
         const result = await pool.request().input('uid', userNo).query(`
-            SELECT 
-                UC.SerialKey, UC.IsPublic, UC.PurchaseDate, 
-                B.Title AS BundleName, B.PublicFeeGP, B.ImageURL,
-                K.ExpireDate, K.Status
-            FROM AdrenalineWeb.dbo.Web_UserCoupons UC
-            JOIN AdrenalineWeb.dbo.Web_PremiumCoupons B ON UC.BundleID = B.CouponID
-            LEFT JOIN GameDB.dbo.T_ItemSerialKey K ON UC.SerialKey = K.SerialKey
-            WHERE UC.UserNo = @uid
-            ORDER BY UC.PurchaseDate DESC
+            SELECT LogID, ActionType AS Action, Amount, LogDate AS Date, Description AS Details
+            FROM AdrenalineWeb.dbo.Web_EconomyLog
+            WHERE UserNo = @uid AND ActionType LIKE 'COUPON_%'
+            ORDER BY LogDate DESC
         `);
-        res.json({ status: 'success', coupons: result.recordset });
+        res.json({ status: 'success', history: result.recordset });
     } catch (err) {
-        res.status(500).json({ message: 'خطأ في جلب الكوبونات' });
+        res.status(500).json({ status: 'error', message: 'فشل جلب السجل' });
     }
 };
