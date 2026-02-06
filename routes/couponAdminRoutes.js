@@ -20,4 +20,9 @@ router.delete('/delete-premium/:id', requireRole(10), couponAdmin.deletePremiumC
 // إنشاء كود هدية (نصي)
 router.post('/create-gift', requireRole(10), couponAdmin.createGiftCoupon);
 
+router.put('/edit-premium/:id', requireRole(10), uploadCoupon.single('image'), couponAdmin.updatePremiumCoupon);
+
+// حذف قسيمة (DELETE) - موجودة سابقاً لكن تأكد من الرابط
+router.delete('/delete-premium/:id', requireRole(10), couponAdmin.deletePremiumCoupon);
+
 module.exports = router;

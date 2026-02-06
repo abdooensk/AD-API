@@ -3,109 +3,101 @@ const { poolPromise, sql } = require('../config/db');
 // 1. تدوير العجلة (Spin) - مع الحماية الكاملة 🛡️
 exports.spinWheel = async (req, res) => {
     const userNo = req.user.userNo;
-    
+
     try {
         const pool = await poolPromise;
 
-        // أ. فحص سعة الحقيبة (حماية من ضياع الجوائز)
-        const invCheck = await pool.request().input('uid', userNo).query("SELECT COUNT(*) as cnt FROM GameDB.dbo.T_UserItem WHERE UserNo = @uid");
-        if (invCheck.recordset[0].cnt >= 240) {
-            return res.status(400).json({ message: 'الحقيبة ممتلئة! أفرغ بعض الخانات أولاً.' });
-        }
+        // 1. التحقق: هل استخدم المحاولة المجانية اليوم؟
+        const userCheck = await pool.request().input('uid', userNo).query(`
+            SELECT LastFreeSpinDate FROM AuthDB.dbo.T_Account WHERE UserNo = @uid
+        `);
+        
+        const lastFreeSpin = userCheck.recordset[0]?.LastFreeSpinDate;
+        const todayStr = new Date().toISOString().split('T')[0];
+        const lastSpinStr = lastFreeSpin ? new Date(lastFreeSpin).toISOString().split('T')[0] : '';
+        
+        const isFreeSpin = (lastSpinStr !== todayStr); // إذا لم يلعب مجاناً اليوم، فهي مجانية
 
-        // ب. التحقق الذري (Atomic Check) لمنع ثغرة التكرار Race Condition 🛡️
-        // نحدث التاريخ فقط إذا كان قديماً. إذا نجح التحديث نكمل، إذا فشل نرفض.
-        const checkAndUpdate = await pool.request()
-            .input('uid', userNo)
-            .query(`
-                UPDATE AuthDB.dbo.T_Account 
-                SET LastSpinDate = GETDATE() 
-                WHERE UserNo = @uid 
-                  AND (LastSpinDate IS NULL OR CAST(LastSpinDate AS DATE) < CAST(GETDATE() AS DATE))
-            `);
-
-        // إذا لم يتم تحديث أي صف، فهذا يعني أن اللاعب لعب اليوم بالفعل
-        if (checkAndUpdate.rowsAffected[0] === 0) {
-            return res.status(400).json({ 
-                message: 'لقد قمت بتدوير العجلة اليوم بالفعل. يمكنك المحاولة مجدداً غداً!' 
-            });
-        }
-
-        // ج. جلب العناصر من قاعدة البيانات
-        const itemsRes = await pool.request().query("SELECT * FROM AdrenalineWeb.dbo.Web_WheelItems WHERE IsActive = 1");
-        const items = itemsRes.recordset;
-
-        if (items.length === 0) {
-            // في حال خطأ كارثي (العجلة فارغة)، نعيد المحاولة للاعب
-            await pool.request().query(`UPDATE AuthDB.dbo.T_Account SET LastSpinDate = DATEADD(day, -1, GETDATE()) WHERE UserNo = ${userNo}`);
-            return res.status(500).json({ message: 'العجلة فارغة حالياً' });
-        }
-
-        // د. خوارزمية الاختيار العشوائي (Weighted Random)
-        let totalWeight = items.reduce((sum, item) => sum + item.Probability, 0);
-        let random = Math.random() * totalWeight;
-        let selectedItem = items.find(item => (random -= item.Probability) < 0) || items[0];
-
-        // هـ. تسليم الجائزة (Transaction)
+        // 2. جلب سعر التدوير (للمحاولات غير المجانية)
+        const settingsRes = await pool.request().query(`
+            SELECT ConfigKey, ConfigValue FROM AdrenalineWeb.dbo.Web_Settings 
+            WHERE ConfigKey IN ('Wheel_SpinPrice', 'Wheel_Currency')
+        `);
+        const price = parseInt(settingsRes.recordset.find(s => s.ConfigKey === 'Wheel_SpinPrice')?.ConfigValue || '0');
+        
+        // 3. بدأ الترانزاكشن
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
 
         try {
-            const request = new sql.Request(transaction);
+            const reqTx = new sql.Request(transaction);
+            reqTx.input('uid', userNo);
 
-            // منح الجائزة بناءً على نوعها
-            // نفترض أن T_UserItem يحتاج ItemType، سنضيف قيمة افتراضية أو نجلبها إذا كانت ناقصة
-            request.input('uid', userNo);
-request.input('itemId', selectedItem.ItemId);
-request.input('count', selectedItem.Count);
-request.input('wItemId', selectedItem.WheelItemID);
-request.input('wItemName', selectedItem.ItemName); // لحماية الاسم من الأحرف الغريبة
-request.input('rewardAmt', selectedItem.RewardAmount || 0);
+            if (isFreeSpin) {
+                // ✅ محاولة مجانية: نحدث تاريخ آخر استخدام مجاني لليوم
+                // هذا يضمن أن المحاولة القادمة في نفس اليوم ستكون مدفوعة
+                await reqTx.query(`UPDATE AuthDB.dbo.T_Account SET LastFreeSpinDate = GETDATE() WHERE UserNo = @uid`);
+            } else {
+                // 💰 محاولة مدفوعة: يجب الخصم
+                if (price > 0) {
+                    const col = 'CashMoney'; // أو حسب الإعدادات
+                    const deduct = await reqTx.query(`
+                        UPDATE GameDB.dbo.T_User 
+                        SET ${col} = ${col} - ${price} 
+                        WHERE UserNo = @uid AND ${col} >= ${price}
+                    `);
+                    if (deduct.rowsAffected[0] === 0) throw new Error('رصيدك غير كافٍ (انتهت المحاولة المجانية)');
+                }
+            }
 
-if (selectedItem.RewardType === 'ITEM') {
-    // استخدمنا @ بدل ${}
-    await request.query(`
+            // ... (باقي كود اختيار الجائزة ومنحها كما هو في الكود السابق) ...
+            
+            // جلب العناصر واختيار عشوائي
+            const itemsRes = await reqTx.query("SELECT * FROM AdrenalineWeb.dbo.Web_WheelItems WHERE IsActive = 1");
+            // ... (نفس منطق الاختيار العشوائي) ...
+             let totalWeight = itemsRes.recordset.reduce((sum, item) => sum + item.Probability, 0);
+            let random = Math.random() * totalWeight;
+            let selectedItem = itemsRes.recordset.find(item => (random -= item.Probability) < 0) || itemsRes.recordset[0];
+
+
+             // د. منح الجائزة
+            reqTx.input('itemId', selectedItem.ItemId);
+            reqTx.input('count', selectedItem.Count);
+            reqTx.input('rewardAmt', selectedItem.RewardAmount || 0);
+
+            if (selectedItem.RewardType === 'ITEM') {
+                 await reqTx.query(`
         INSERT INTO GameDB.dbo.T_UserItem 
         (UserNo, ItemId, Count, Status, StartDate, EndDate, IsBaseItem, ItemType)
         VALUES (@uid, @itemId, @count, 1, GETDATE(), DATEADD(DAY, 7, GETDATE()), 0, 1)
     `);
-} else if (selectedItem.RewardType === 'GP') { 
-    // لاحظ: @rewardAmt و @uid
-    await request.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney + @rewardAmt WHERE UserNo = @uid`);
-} else if (selectedItem.RewardType === 'REGULAR') { 
-    await request.query(`UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney + @rewardAmt WHERE UserNo = @uid`);
-}
+            } else if (selectedItem.RewardType === 'GP') { 
+                await reqTx.query(`UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney + @rewardAmt WHERE UserNo = @uid`);
+            } else if (selectedItem.RewardType === 'REGULAR') { 
+                await reqTx.query(`UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney + @rewardAmt WHERE UserNo = @uid`);
+            }
 
-// تسجيل العملية بشكل آمن
-await request.query(`
-    INSERT INTO AdrenalineWeb.dbo.Web_WheelLog (UserNo, WheelItemID, RewardName)
-    VALUES (@uid, @wItemId, @wItemName)
-`);
-
-            // تسجيل العملية في اللوج
-            await request.query(`
-                INSERT INTO AdrenalineWeb.dbo.Web_WheelLog (UserNo, WheelItemID, RewardName)
-                VALUES (${userNo}, ${selectedItem.WheelItemID}, N'${selectedItem.ItemName}')
+            // تسجيل اللوج
+            await reqTx.input('wItemName', selectedItem.ItemName).input('wItemId', selectedItem.WheelItemID).query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_WheelLog (UserNo, WheelItemID, RewardName, Cost)
+                VALUES (@uid, @wItemId, @wItemName, ${isFreeSpin ? 0 : price})
             `);
-
+            
             await transaction.commit();
-
+            
             res.json({ 
                 status: 'success', 
                 message: `مبروك! حصلت على ${selectedItem.ItemName}`, 
-                reward: selectedItem 
+                reward: selectedItem,
+                isFreeSpin: isFreeSpin // نعلم الفرونت إند هل كانت مجانية
             });
 
         } catch (err) {
             await transaction.rollback();
-            // في حال فشل التسليم، نعيد الحق للاعب في المحاولة
-            await pool.request().query(`UPDATE AuthDB.dbo.T_Account SET LastSpinDate = DATEADD(day, -1, GETDATE()) WHERE UserNo = ${userNo}`);
-            throw err;
+            return res.status(400).json({ message: err.message });
         }
-
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'فشلت عملية تدوير العجلة' });
+        res.status(500).json({ message: 'خطأ في السيرفر' });
     }
 };
 

@@ -6,7 +6,8 @@ const { v4: uuidv4 } = require('uuid');
 const { decodeReferralCode } = require('../utils/referralCodec');
 const path = require('path'); // لا تنس استدعاء مكتبة path في أعلى الملف
 require('dotenv').config(); // 👈 مهم لقراءة الإيميل والباسورد من الملف السري
-
+const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_adrenaline_key_2026';
 
 const hashPassword = (password) => {
@@ -17,6 +18,7 @@ const hashPassword = (password) => {
     // ⚠️ إذا استخدمت الـ Salt (UserId + Password) في SQL، يجب أن تفعل مثله هنا:
     // return crypto.createHash('sha512').update(userId + password).digest('hex').toUpperCase();
 };
+
 // 📧 إعدادات إرسال الإيميل (يقرأ الآن من ملف .env)
 const transporter = nodemailer.createTransport({
     service: 'gmail',
@@ -39,10 +41,14 @@ exports.login = async (req, res) => {
 
     try {
         const pool = await poolPromise;
+        
+        // 1. جلب بيانات المستخدم
+        // ⚠️ تأكد أنك أضفت الأعمدة Email و IsEmailVerified في جدول T_Account في قاعدة البيانات
+        // وإلا سيفشل هذا الاستعلام ويعطي خطأ 500
         const result = await pool.request()
             .input('uid', username)
             .query(`
-                SELECT A.UserNo, A.UserId, A.Password, A.IsBanned, A.IsEmailVerified, A.Email, -- 👈 أضفنا Email هنا
+                SELECT A.UserNo, A.UserId, A.Password, A.IsBanned, A.IsEmailVerified, A.Email,
                        U.GMGrade, U.Nickname 
                 FROM AuthDB.dbo.T_Account A
                 LEFT JOIN GameDB.dbo.T_User U ON A.UserNo = U.UserNo 
@@ -53,20 +59,63 @@ exports.login = async (req, res) => {
 
         if (!user) return res.status(404).json({ message: 'اسم المستخدم غير موجود' });
         
-        // 🔥 التعديل هنا: التحقق باستخدام الهاش
+        // 2. التحقق من كلمة المرور
         const inputHash = hashPassword(password);
         if (user.Password !== inputHash) {
             return res.status(401).json({ message: 'كلمة المرور غير صحيحة' });
         }
         
-        // التحقق من تفعيل الإيميل (التعديل الجديد)
+        // 3. التحقق من تفعيل الإيميل
         if (user.IsEmailVerified === false) {
             return res.status(403).json({ 
                 message: 'يجب تأكيد البريد الإلكتروني أولاً. راجع صندوق الوارد.',
-                errorType: 'NOT_VERIFIED', // كود ليستخدمه الموقع لإظهار الأزرار
-                currentEmail: user.Email   // نرسل الإيميل الحالي ليعرف اللاعب أين الخطأ
+                errorType: 'NOT_VERIFIED',
+                currentEmail: user.Email
             });
         }
+
+        // ============================================================
+        // 🆕 منطق الحضور المتواصل (Consecutive Attendance Logic)
+        // ============================================================
+        try {
+            // تعريف التاريخ هنا لضمان دقته في كل عملية دخول
+            const todayDate = new Date().toISOString().split('T')[0];
+            const yesterdayDate = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+
+            // التحقق من آخر تسجيل استلام مكافأة
+            const attendanceCheck = await pool.request()
+                .input('u_no', user.UserNo)
+                .query("SELECT LastClaimDate FROM AdrenalineWeb.dbo.Web_DailyAttendance WHERE UserNo = @u_no");
+
+            if (attendanceCheck.recordset.length > 0) {
+                const lastClaimDate = attendanceCheck.recordset[0].LastClaimDate;
+                let lastDateStr = '';
+                
+                if (lastClaimDate) {
+                    lastDateStr = new Date(lastClaimDate).toISOString().split('T')[0];
+                }
+
+                // الشرط: إذا لم يكن آخر استلام هو "اليوم" ولم يكن "الأمس"
+                // فهذا يعني أنه فاته يوم، لذا نصفر العداد
+                if (lastDateStr !== todayDate && lastDateStr !== yesterdayDate) {
+                    await pool.request().query(`
+                        UPDATE AdrenalineWeb.dbo.Web_DailyAttendance 
+                        SET ConsecutiveDays = 0, LoginRewardClaimed = 0 
+                        WHERE UserNo = ${user.UserNo}
+                    `);
+                }
+            } else {
+                // مستخدم جديد في جدول الحضور: ننشئ له سجلاً
+                await pool.request().query(`
+                    INSERT INTO AdrenalineWeb.dbo.Web_DailyAttendance (UserNo, ConsecutiveDays, LoginRewardClaimed) 
+                    VALUES (${user.UserNo}, 0, 0)
+                `);
+            }
+        } catch (attErr) {
+            console.error("خطأ في نظام الحضور (غير مؤثر على الدخول):", attErr.message);
+            // لا نوقف الدخول إذا فشل نظام الحضور
+        }
+        // ============================================================
 
         const isBanned = user.IsBanned === 1 || user.IsBanned === true;
         const token = jwt.sign(
@@ -74,7 +123,7 @@ exports.login = async (req, res) => {
                 userNo: user.UserNo, 
                 userId: user.UserId, 
                 isAdmin: user.GMGrade >= 1, 
-                role: user.GMGrade, // ✅ ضروري جداً لعمل requireRole
+                role: user.GMGrade, 
                 isBanned: isBanned 
             },
             JWT_SECRET, { expiresIn: '24h' }
@@ -89,12 +138,13 @@ exports.login = async (req, res) => {
                 username: user.UserId,
                 nickname: user.Nickname || null,
                 isGM: user.GMGrade >= 1,
-                grade: user.GMGrade, // يفضل إرجاعه للفرونت إند أيضاً
+                grade: user.GMGrade,
                 isBanned: isBanned
             }
         });
     } catch (err) {
         console.error(err);
+        // هذا الخطأ يظهر عادة إذا كانت الأعمدة Email أو IsEmailVerified غير موجودة في الداتابيس
         res.status(500).json({ message: 'حدث خطأ في السيرفر', error: err.message });
     }
 };

@@ -9,7 +9,7 @@ const adminShop = require('../controllers/adminShopController');
 const toolsController = require('../controllers/adminToolsController'); // ✅
 const agentController = require('../controllers/agentController');
 const investigatorController = require('../controllers/investigatorController');
-
+const adminWheel = require('../controllers/adminWheelController');
 // 2. استيراد الحماية
 const auth = require('../middleware/authMiddleware');
 const admin = require('../middleware/adminMiddleware'); // تأكد أن لديك هذا الملف أو احذف السطر إذا لم تستخدمه
@@ -97,5 +97,8 @@ router.put('/shop/update', requireRole(10), adminShop.updateShopItem);
 if (adminController.getServerEconomy) {
     router.get('/economy', requireRole(10), adminController.getServerEconomy);
 }
-
+router.get('/wheel/config', requireRole(10), adminWheel.getWheelConfig);
+router.post('/wheel/settings', requireRole(10), adminWheel.updateWheelSettings);
+router.post('/wheel/item', requireRole(10), adminWheel.upsertWheelItem); // للإضافة والتعديل
+router.delete('/wheel/item/:id', requireRole(10), adminWheel.deleteWheelItem);
 module.exports = router;

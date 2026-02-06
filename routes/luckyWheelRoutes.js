@@ -9,4 +9,9 @@ router.get('/items', luckyWheelController.getWheelItems);
 // 2. تدوير العجلة (يتطلب تسجيل دخول)
 router.post('/spin', auth, luckyWheelController.spinWheel);
 
+router.get('/info', auth, luckyWheelController.getWheelItems); 
+
+// 2. تدوير العجلة
+router.post('/spin', auth, luckyWheelController.spinWheel);
+
 module.exports = router;

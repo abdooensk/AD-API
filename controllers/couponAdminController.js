@@ -129,24 +129,40 @@ exports.createGiftCoupon = async (req, res) => {
     try {
         const pool = await poolPromise;
         
+        // تجهيز السيريال
         let serialKey = customCode;
         if (!serialKey) {
             serialKey = `${generateSegment(6)}-${generateSegment(6)}-${generateSegment(4)}`;
         }
         serialKey = serialKey.toUpperCase();
 
+        // تجهيز العناصر (تحويل القيم الفارغة إلى null)
         const dbItems = [];
         for (let i = 0; i < 9; i++) {
             if (items && items[i] && items[i].id > 0) {
-                dbItems[i] = { id: items[i].id, days: items[i].days };
+                dbItems[i] = { id: parseInt(items[i].id), days: parseInt(items[i].days) };
             } else {
-                dbItems[i] = { id: 'NULL', days: 'NULL' };
+                dbItems[i] = { id: null, days: null };
             }
         }
 
-        const money = gameMoney || 0;
+        const money = gameMoney ? parseInt(gameMoney) : 0;
+        const daysToExpire = expireDays ? parseInt(expireDays) : 365;
 
-        await pool.request().query(`
+        // استخدام Parameters بدلاً من السترينج المباشر
+        const request = pool.request();
+        
+        request.input('serial', serialKey);
+        request.input('days', daysToExpire);
+        request.input('money', money);
+        
+        // إدخال العناصر كـ Inputs
+        for(let i=0; i<9; i++) {
+            request.input(`i${i+1}`, dbItems[i].id);
+            request.input(`d${i+1}`, dbItems[i].days);
+        }
+
+        await request.query(`
             INSERT INTO GameDB.dbo.T_ItemSerialKey 
             (
                 SerialKey, TargetUserNo, OneTimeKey, RegDate, ExpireDate, SupplyGameMoney,
@@ -156,17 +172,145 @@ exports.createGiftCoupon = async (req, res) => {
             )
             VALUES 
             (
-                '${serialKey}', NULL, 0, GETDATE(), DATEADD(DAY, ${expireDays || 365}, GETDATE()), ${money},
-                ${dbItems[0].id}, ${dbItems[0].days}, ${dbItems[1].id}, ${dbItems[1].days}, ${dbItems[2].id}, ${dbItems[2].days},
-                ${dbItems[3].id}, ${dbItems[3].days}, ${dbItems[4].id}, ${dbItems[4].days}, ${dbItems[5].id}, ${dbItems[5].days},
-                ${dbItems[6].id}, ${dbItems[6].days}, ${dbItems[7].id}, ${dbItems[7].days}, ${dbItems[8].id}, ${dbItems[8].days}
+                @serial, NULL, 0, GETDATE(), DATEADD(DAY, @days, GETDATE()), @money,
+                @i1, @d1, @i2, @d2, @i3, @d3,
+                @i4, @d4, @i5, @d5, @i6, @d6,
+                @i7, @d7, @i8, @d8, @i9, @d9
             )
         `);
 
         res.json({ status: 'success', message: `تم إنشاء كود الهدية: ${serialKey}`, code: serialKey });
 
     } catch (err) {
+        // التحقق من خطأ تكرار المفتاح الأساسي (Violation of PRIMARY KEY constraint)
+        if(err.number === 2627) {
+             return res.status(400).json({ message: 'الكود موجود مسبقاً، حاول مرة أخرى' });
+        }
         console.error(err);
         res.status(500).json({ message: 'فشل إنشاء الهدية', error: err.message });
+    }
+};
+exports.updatePremiumCoupon = async (req, res) => {
+    const { id } = req.params;
+    // نستقبل البيانات التي نريد تعديلها
+    const { title, price, publicFee, description, items } = req.body;
+    const file = req.file; // الصورة الجديدة إن وجدت
+
+    try {
+        const pool = await poolPromise;
+        
+        // 1. أولاً: نجلب القسيمة القديمة للتأكد من وجودها ولمعرفة مسار الصورة القديمة
+        const oldCouponRes = await pool.request()
+            .input('id', id)
+            .query("SELECT * FROM AdrenalineWeb.dbo.Web_PremiumCoupons WHERE CouponID = @id");
+            
+        const oldCoupon = oldCouponRes.recordset[0];
+        if (!oldCoupon) {
+            // إذا رفع صورة لكن القسيمة غير موجودة، نحذف الصورة المرفوعة لتنظيف السيرفر
+            if (file) fs.unlinkSync(file.path);
+            return res.status(404).json({ message: 'القسيمة غير موجودة' });
+        }
+
+        // 2. معالجة الصورة
+        let finalImage = oldCoupon.ImageURL; // افتراضياً نبقي الصورة القديمة
+        if (file) {
+            finalImage = `/uploads/coupons/${file.filename}`;
+            
+            // (اختياري) حذف الصورة القديمة من السيرفر لتوفير المساحة
+            // const oldPath = path.join(__dirname, '../public', oldCoupon.ImageURL);
+            // if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+        }
+
+        // 3. معالجة العناصر (Items) إذا تم إرسالها
+        let i1=oldCoupon.ItemId1, d1=oldCoupon.ItemDays1, 
+            i2=oldCoupon.ItemId2, d2=oldCoupon.ItemDays2, 
+            i3=oldCoupon.ItemId3, d3=oldCoupon.ItemDays3, 
+            i4=oldCoupon.ItemId4, d4=oldCoupon.ItemDays4, 
+            i5=oldCoupon.ItemId5, d5=oldCoupon.ItemDays5, 
+            i6=oldCoupon.ItemId6, d6=oldCoupon.ItemDays6, 
+            i7=oldCoupon.ItemId7, d7=oldCoupon.ItemDays7, 
+            i8=oldCoupon.ItemId8, d8=oldCoupon.ItemDays8, 
+            i9=oldCoupon.ItemId9, d9=oldCoupon.ItemDays9;
+
+        if (items) {
+            let parsedItems = [];
+            try {
+                parsedItems = typeof items === 'string' ? JSON.parse(items) : items;
+                const slots = Array(9).fill({ id: 0, days: 0 });
+                parsedItems.slice(0, 9).forEach((item, index) => {
+                    slots[index] = { id: parseInt(item.id) || 0, days: parseInt(item.days) || 0 };
+                });
+                // تحديث المتغيرات
+                [i1, d1] = [slots[0].id, slots[0].days];
+                [i2, d2] = [slots[1].id, slots[1].days];
+                [i3, d3] = [slots[2].id, slots[2].days];
+                [i4, d4] = [slots[3].id, slots[3].days];
+                [i5, d5] = [slots[4].id, slots[4].days];
+                [i6, d6] = [slots[5].id, slots[5].days];
+                [i7, d7] = [slots[6].id, slots[6].days];
+                [i8, d8] = [slots[7].id, slots[7].days];
+                [i9, d9] = [slots[8].id, slots[8].days];
+
+            } catch (e) {
+                console.error("Error parsing items:", e);
+                // لا نوقف العملية، بل نبقي العناصر القديمة أو نعيد خطأ حسب رغبتك
+            }
+        }
+
+        // 4. تنفيذ التحديث
+        await pool.request()
+            .input('id', id)
+            .input('title', title || oldCoupon.Title)
+            .input('price', price || oldCoupon.PriceGP)
+            .input('fee', publicFee !== undefined ? publicFee : oldCoupon.PublicFeeGP)
+            .input('desc', description !== undefined ? description : oldCoupon.Description)
+            .input('img', finalImage)
+            
+            // مدخلات العناصر التسعة
+            .input('i1', i1).input('d1', d1).input('i2', i2).input('d2', d2)
+            .input('i3', i3).input('d3', d3).input('i4', i4).input('d4', d4)
+            .input('i5', i5).input('d5', d5).input('i6', i6).input('d6', d6)
+            .input('i7', i7).input('d7', d7).input('i8', i8).input('d8', d8)
+            .input('i9', i9).input('d9', d9)
+
+            .query(`
+                UPDATE AdrenalineWeb.dbo.Web_PremiumCoupons
+                SET 
+                    Title = @title,
+                    PriceGP = @price,
+                    PublicFeeGP = @fee,
+                    Description = @desc,
+                    ImageURL = @img,
+                    ItemId1=@i1, ItemDays1=@d1, ItemId2=@i2, ItemDays2=@d2, ItemId3=@i3, ItemDays3=@d3,
+                    ItemId4=@i4, ItemDays4=@d4, ItemId5=@i5, ItemDays5=@d5, ItemId6=@i6, ItemDays6=@d6,
+                    ItemId7=@i7, ItemDays7=@d7, ItemId8=@i8, ItemDays8=@d8, ItemId9=@i9, ItemDays9=@d9
+                WHERE CouponID = @id
+            `);
+
+        res.json({ status: 'success', message: 'تم تحديث القسيمة بنجاح', imageUrl: finalImage });
+
+    } catch (err) {
+        console.error(err);
+        if (file && fs.existsSync(file.path)) fs.unlinkSync(file.path); // تنظيف عند الخطأ
+        res.status(500).json({ message: 'فشل التحديث', error: err.message });
+    }
+};
+
+// =========================================================
+// 6. حذف قسيمة (تحسين الدالة الموجودة)
+// =========================================================
+exports.deletePremiumCoupon = async (req, res) => {
+    const { id } = req.params;
+    try {
+        const pool = await poolPromise;
+        // نستخدم Soft Delete (IsActive = 0) للحفاظ على سجلات المبيعات القديمة
+        // إذا حذفتها نهائياً (DELETE FROM)، ستختفي من سجل مشتريات اللاعبين وهذا خطأ
+        await pool.request()
+            .input('id', id)
+            .query("UPDATE AdrenalineWeb.dbo.Web_PremiumCoupons SET IsActive = 0 WHERE CouponID = @id");
+            
+        res.json({ status: 'success', message: 'تم تعطيل القسيمة بنجاح' });
+    } catch (err) {
+        res.status(500).json({ message: 'فشل الحذف', error: err.message });
     }
 };
