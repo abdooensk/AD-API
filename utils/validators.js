@@ -8,15 +8,22 @@ const loginSchema = Joi.object({
 });
 
 // 2. قواعد التسجيل (⚠️ تصحيح: غيرنا username إلى userid ليطابق authController)
+// 2. قواعد التسجيل
 const registerSchema = Joi.object({
-    userid: Joi.string().alphanum().min(3).max(20).required().messages({
-        'string.min': 'اسم المستخدم يجب أن يكون 3 أحرف على الأقل',
-        'any.required': 'اسم المستخدم مطلوب'
-    }),
+    username: Joi.string() // 👈 تم التغيير من userid إلى username
+        .min(3).max(20)
+        .pattern(/^[a-zA-Z0-9_.-]+$/) 
+        .required()
+        .messages({
+            'string.min': 'اسم المستخدم يجب أن يكون 3 أحرف على الأقل',
+            'string.max': 'اسم المستخدم يجب ألا يتجاوز 20 حرفاً',
+            'string.pattern.base': 'اسم المستخدم يجب أن يحتوي على أحرف وأرقام أو (_ . -) فقط',
+            'any.required': 'اسم المستخدم مطلوب'
+        }),
     password: Joi.string().min(6).required(),
     email: Joi.string().email().required(),
-    referralCode: Joi.string().optional().allow('').allow(null) // للسماح بكود الدعوة الاختياري
-});
+    referralCode: Joi.string().optional().allow('').allow(null)
+}).unknown(true);
 
 // 3. قواعد التحويل المالي (للمحفظة)
 const transactionSchema = Joi.object({

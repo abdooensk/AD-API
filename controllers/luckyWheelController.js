@@ -110,21 +110,25 @@ exports.getWheelItems = async (req, res) => {
         // 1. جلب العناصر
         const itemsRes = await pool.request().query("SELECT ItemName, RewardType, RewardAmount FROM AdrenalineWeb.dbo.Web_WheelItems WHERE IsActive = 1");
         
-        // 2. التحقق من حالة اللاعب (هل لعب اليوم؟)
-        const userRes = await pool.request().input('uid', userNo).query("SELECT LastSpinDate FROM AuthDB.dbo.T_Account WHERE UserNo = @uid");
-        const lastSpin = userRes.recordset[0]?.LastSpinDate;
+        // 2. التحقق من حالة اللاعب (هل لعب مجاناً اليوم؟)
+        // 👈 تم التعديل هنا للقراءة من LastFreeSpinDate
+        const userRes = await pool.request().input('uid', userNo).query("SELECT LastFreeSpinDate FROM AuthDB.dbo.T_Account WHERE UserNo = @uid");
         
-        let canSpin = true;
+        // 👈 وهنا نستخدم الاسم الصحيح
+        const lastSpin = userRes.recordset[0]?.LastFreeSpinDate;
+        
+        let canSpin = true; // نفترض أنه يستطيع اللعب (مجاناً)
         if (lastSpin) {
             const lastDate = new Date(lastSpin).toISOString().split('T')[0];
             const today = new Date().toISOString().split('T')[0];
+            // إذا كان تاريخ آخر لعب مجاني هو اليوم، نرسل false ليظهر السعر بدلاً من "مجاني"
             if (lastDate === today) canSpin = false;
         }
 
         res.json({ 
             status: 'success', 
             items: itemsRes.recordset,
-            canSpin: canSpin,
+            canSpin: canSpin, // true = مجاني متاح، false = مدفوع
             lastSpin: lastSpin
         });
 

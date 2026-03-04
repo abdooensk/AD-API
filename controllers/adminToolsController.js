@@ -979,3 +979,19 @@ async function logAdminAction(adminId, action, details) {
         .input('details', details)
         .query("INSERT INTO AdrenalineWeb.dbo.Web_AdminLog (AdminID, Action, Details) VALUES (@admin, @action, @details)");
 }
+// تغيير حالة السيرفر
+exports.setServerStatus = async (req, res) => {
+    const { status, message } = req.body; // 1 or 0
+    try {
+        const pool = await poolPromise;
+        // تحديث الحالة
+        await pool.request().input('val', status).query("UPDATE AdrenalineWeb.dbo.Web_Settings SET ConfigValue = @val WHERE ConfigKey = 'ServerStatus'");
+        
+        // تحديث رسالة الصيانة (اختياري)
+        if (message) {
+            await pool.request().input('msg', message).query("UPDATE AdrenalineWeb.dbo.Web_Settings SET ConfigValue = @msg WHERE ConfigKey = 'MaintenanceMessage'");
+        }
+        
+        res.json({ status: 'success', message: `تم تغيير حالة السيرفر إلى ${status == 1 ? 'Online' : 'Maintenance'}` });
+    } catch (err) { res.status(500).json({ message: 'Error' }); }
+};

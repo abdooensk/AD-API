@@ -40,24 +40,51 @@ const couponStorage = multer.diskStorage({
 
 // --- فلتر عام للصور ---
 const imageFilter = (req, file, cb) => {
+    // قبول فقط الملفات التي تبدأ بـ image/
     if (file.mimetype.startsWith('image/')) {
         cb(null, true);
     } else {
-        cb(new Error('يسمح برفع الصور فقط!'), false);
+        // نمرر خطأ مخصص ليتم التقاطه في الراوت
+        cb(new Error('يسمح برفع الصور فقط (jpg, png, jpeg)!'), false);
     }
 };
 
 // --- التصدير ---
-// 1. أداة رفع التذاكر (استخدمها في ticketRoutes)
+
+// 1. أداة رفع التذاكر (تم رفع الحد إلى 10 ميجا لحل المشكلة)
 exports.uploadTicket = multer({ 
     storage: ticketStorage,
-    limits: { fileSize: 5 * 1024 * 1024 }, // 5 ميجا للتذاكر
+    limits: { fileSize: 10 * 1024 * 1024 }, // 👈 10 ميجابايت
     fileFilter: imageFilter
 });
 
-// 2. أداة رفع القسائم (استخدمها في couponAdminRoutes)
+// 2. أداة رفع القسائم
 exports.uploadCoupon = multer({ 
     storage: couponStorage,
-    limits: { fileSize: 2 * 1024 * 1024 }, // 2 ميجا للقسائم (لأنها ستظهر في المتجر)
+    limits: { fileSize: 2 * 1024 * 1024 }, // 2 ميجابايت (كافية لأيقونات المتجر)
+    fileFilter: imageFilter
+});
+// ... (بعد إعدادات التذاكر والكوبونات)
+
+// --- 3. إعدادات الأخبار (News) ---
+const newsDir = 'public/uploads/news';
+ensureDir(newsDir);
+
+const newsStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, newsDir);
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now();
+        cb(null, 'news-' + uniqueSuffix + path.extname(file.originalname));
+    }
+});
+
+// ... (في نهاية الملف عند التصدير exports)
+
+// 3. أداة رفع الأخبار
+exports.uploadNews = multer({ 
+    storage: newsStorage,
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5 ميجابايت كحد أقصى
     fileFilter: imageFilter
 });

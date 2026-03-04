@@ -52,3 +52,29 @@ exports.updateSetting = async (req, res) => {
         res.status(500).json({ message: 'فشل تحديث الإعدادات', error: err.message });
     }
 };
+// جلب الشروط
+exports.getTerms = async (req, res) => {
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request()
+            .query("SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'TermsAndConditions'");
+        res.json({ status: 'success', content: result.recordset[0]?.ConfigValue || '' });
+    } catch (err) { res.status(500).json({ message: 'Error' }); }
+};
+
+// تحديث الشروط (للأدمن)
+exports.updateTerms = async (req, res) => {
+    const { content } = req.body;
+    try {
+        const pool = await poolPromise;
+        // Upsert logic (Update if exists, Insert if not)
+        await pool.request().input('val', content).query(`
+            MERGE AdrenalineWeb.dbo.Web_Settings AS target
+            USING (SELECT 'TermsAndConditions' AS keyname) AS source
+            ON (target.ConfigKey = source.keyname)
+            WHEN MATCHED THEN UPDATE SET ConfigValue = @val
+            WHEN NOT MATCHED THEN INSERT (ConfigKey, ConfigValue) VALUES ('TermsAndConditions', @val);
+        `);
+        res.json({ status: 'success', message: 'تم الحفظ' });
+    } catch (err) { res.status(500).json({ message: 'Error' }); }
+};

@@ -43,8 +43,6 @@ exports.login = async (req, res) => {
         const pool = await poolPromise;
         
         // 1. جلب بيانات المستخدم
-        // ⚠️ تأكد أنك أضفت الأعمدة Email و IsEmailVerified في جدول T_Account في قاعدة البيانات
-        // وإلا سيفشل هذا الاستعلام ويعطي خطأ 500
         const result = await pool.request()
             .input('uid', username)
             .query(`
@@ -75,14 +73,13 @@ exports.login = async (req, res) => {
         }
 
         // ============================================================
-        // 🆕 منطق الحضور المتواصل (Consecutive Attendance Logic)
+        // 🆕 4. منطق الحضور المتواصل (Consecutive Attendance Logic)
         // ============================================================
         try {
-            // تعريف التاريخ هنا لضمان دقته في كل عملية دخول
             const todayDate = new Date().toISOString().split('T')[0];
             const yesterdayDate = new Date(Date.now() - 86400000).toISOString().split('T')[0];
 
-            // التحقق من آخر تسجيل استلام مكافأة
+            // التحقق من سجل الحضور
             const attendanceCheck = await pool.request()
                 .input('u_no', user.UserNo)
                 .query("SELECT LastClaimDate FROM AdrenalineWeb.dbo.Web_DailyAttendance WHERE UserNo = @u_no");
@@ -95,8 +92,7 @@ exports.login = async (req, res) => {
                     lastDateStr = new Date(lastClaimDate).toISOString().split('T')[0];
                 }
 
-                // الشرط: إذا لم يكن آخر استلام هو "اليوم" ولم يكن "الأمس"
-                // فهذا يعني أنه فاته يوم، لذا نصفر العداد
+                // إذا فاته يوم (لم يدخل اليوم ولم يدخل أمس)، نصفر العداد
                 if (lastDateStr !== todayDate && lastDateStr !== yesterdayDate) {
                     await pool.request().query(`
                         UPDATE AdrenalineWeb.dbo.Web_DailyAttendance 
@@ -105,26 +101,53 @@ exports.login = async (req, res) => {
                     `);
                 }
             } else {
-                // مستخدم جديد في جدول الحضور: ننشئ له سجلاً
+                // مستخدم جديد: ننشئ له سجلاً مع وضع تاريخ "أمس" ليتمكن من استلام المكافأة فوراً
                 await pool.request().query(`
-                    INSERT INTO AdrenalineWeb.dbo.Web_DailyAttendance (UserNo, ConsecutiveDays, LoginRewardClaimed) 
-                    VALUES (${user.UserNo}, 0, 0)
+                    INSERT INTO AdrenalineWeb.dbo.Web_DailyAttendance (UserNo, ConsecutiveDays, LoginRewardClaimed, LastClaimDate) 
+                    VALUES (${user.UserNo}, 0, 0, DATEADD(day, -1, GETDATE()))
                 `);
             }
         } catch (attErr) {
             console.error("خطأ في نظام الحضور (غير مؤثر على الدخول):", attErr.message);
-            // لا نوقف الدخول إذا فشل نظام الحضور
         }
-        // ============================================================
 
+        // ============================================================
+        // 🆕 5. إدارة الجلسات (Session Management) - للأمان
+        // ============================================================
+        
+        // أ. إنشاء معرف للجلسة
+        const sessionId = uuidv4();
+        
+        // ب. الحصول على معلومات الجهاز و IP
+        const userAgent = req.headers['user-agent'] || 'Unknown Device';
+        // محاولة جلب IP الحقيقي في حال وجود بروكسي، أو العنوان المباشر
+        const userIP = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
+
+        // ج. حفظ الجلسة في قاعدة البيانات
+        await pool.request()
+            .input('sid', sessionId)
+            .input('uid', user.UserNo)
+            .input('ip', userIP)
+            .input('device', userAgent)
+            .query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_LoginSessions (SessionID, UserNo, IPAddress, DeviceName, IsActive)
+                VALUES (@sid, @uid, @ip, @device, 1)
+            `);
+
+        // ============================================================
+        // 6. إصدار التوكن (JWT)
+        // ============================================================
+        
         const isBanned = user.IsBanned === 1 || user.IsBanned === true;
+        
         const token = jwt.sign(
             { 
                 userNo: user.UserNo, 
                 userId: user.UserId, 
                 isAdmin: user.GMGrade >= 1, 
                 role: user.GMGrade, 
-                isBanned: isBanned 
+                isBanned: isBanned,
+                sessionId: sessionId // 👈 إضافة رقم الجلسة للتوكن
             },
             JWT_SECRET, { expiresIn: '24h' }
         );
@@ -142,23 +165,20 @@ exports.login = async (req, res) => {
                 isBanned: isBanned
             }
         });
+
     } catch (err) {
-        console.error(err);
-        // هذا الخطأ يظهر عادة إذا كانت الأعمدة Email أو IsEmailVerified غير موجودة في الداتابيس
+        console.error("Login Error:", err);
         res.status(500).json({ message: 'حدث خطأ في السيرفر', error: err.message });
     }
 };
 
 // 2. إنشاء حساب جديد (Register) - (كما هو تماماً في نسختك)
 exports.register = async (req, res) => {
-    // 👇 التعديل هنا: استخدام userid و referralCode ليطابق Postman
-    const { userid, password, email, referralCode } = req.body;
+    // التأكد من استخدام username ليطابق الواجهة
+    const { username, password, email, referralCode } = req.body;
 
-    console.log('بيانات التسجيل:', req.body); // للتأكد في الكونسول
-
-    // التحقق من المتغيرات بالأسماء الجديدة
-    if (!userid || !password || !email) {
-        return res.status(400).json({ message: 'البيانات ناقصة: تأكد من إرسال userid, password, email' });
+    if (!username || !password || !email) {
+        return res.status(400).json({ message: 'البيانات ناقصة' });
     }
 
     try {
@@ -166,7 +186,7 @@ exports.register = async (req, res) => {
 
         // 1. التحقق من التكرار
         const check = await pool.request()
-            .input('uid', userid)
+            .input('uid', username)
             .input('email', email)
             .query('SELECT UserId FROM AuthDB.dbo.T_Account WHERE UserId = @uid OR Email = @email');
         
@@ -174,12 +194,12 @@ exports.register = async (req, res) => {
             return res.status(400).json({ message: 'اسم المستخدم أو البريد مسجل مسبقاً' });
         }
 
-        // 2. معالجة كود الدعوة (تحويل الكود النصي إلى رقم)
-        let referrerUserNo = null;
+        // 2. معالجة كود الدعوة (جعل المتغير متاحاً دائماً)
+        let referrerUserNo = null; // ✅ تعريفه هنا يضمن وجوده حتى لو لم يتم إرسال كود
+        
         if (referralCode) {
             const decodedId = decodeReferralCode(referralCode);
             if (decodedId) {
-                // التأكد من أن الداعي موجود فعلاً
                 const refCheck = await pool.request().query(`SELECT UserNo FROM AuthDB.dbo.T_Account WHERE UserNo = ${decodedId}`);
                 if (refCheck.recordset.length > 0) {
                     referrerUserNo = decodedId;
@@ -188,17 +208,15 @@ exports.register = async (req, res) => {
         }
 
         // 3. الإدخال في قاعدة البيانات
-        const verificationToken = require('crypto').randomBytes(32).toString('hex');
-        
-        // 🔥 التعديل هنا: تشفير كلمة المرور قبل الحفظ
+        const verificationToken = crypto.randomBytes(32).toString('hex');
         const hashedPassword = hashPassword(password);
 
         await pool.request()
-            .input('uid', userid)
-            .input('pass', hashedPassword) // 👈 نرسل الباسورد المشفر (hashedPassword) بدلاً من العادي
+            .input('uid', username)
+            .input('pass', hashedPassword)
             .input('email', email)
             .input('token', verificationToken)
-            .input('ref', referrerUserNo) // 👈 إدخال رقم الداعي
+            .input('ref', referrerUserNo) // ✅ سيأخذ القيمة null إذا لم يوجد كود دعوة
             .query(`
                 INSERT INTO AuthDB.dbo.T_Account 
                 (UserId, Password, Email, IsEmailVerified, VerificationToken, ReferredBy, RegDate, IsBanned)
@@ -485,6 +503,59 @@ exports.resetPassword = async (req, res) => {
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'فشل تغيير كلمة المرور' });
+    }
+};
+exports.changeEmail = async (req, res) => {
+    const { password, newEmail } = req.body;
+    const userNo = req.user.userNo;
+
+    if (!password || !newEmail) return res.status(400).json({ message: 'يجب إدخال كلمة المرور والبريد الجديد' });
+
+    try {
+        const pool = await poolPromise;
+
+        // 1. التحقق من كلمة المرور
+        const userCheck = await pool.request()
+            .input('uid', userNo)
+            .query("SELECT Password FROM AuthDB.dbo.T_Account WHERE UserNo = @uid");
+        
+        const currentPass = userCheck.recordset[0]?.Password;
+        const inputHash = hashPassword(password); // تأكد أن دالة hashPassword متاحة في هذا الملف
+
+        if (currentPass !== inputHash) {
+            return res.status(401).json({ message: 'كلمة المرور غير صحيحة' });
+        }
+
+        // 2. التحقق من أن البريد غير مستخدم
+        const emailCheck = await pool.request().input('email', newEmail).query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE Email = @email");
+        if (emailCheck.recordset.length > 0) return res.status(400).json({ message: 'البريد الإلكتروني مستخدم بالفعل' });
+
+        // 3. تحديث البريد (وإلغاء التفعيل ليتطلب تفعيلاً جديداً - أمان أعلى)
+        const newToken = uuidv4();
+        await pool.request()
+            .input('uid', userNo)
+            .input('email', newEmail)
+            .input('token', newToken)
+            .query(`
+                UPDATE AuthDB.dbo.T_Account 
+                SET Email = @email, IsEmailVerified = 0, VerificationToken = @token 
+                WHERE UserNo = @uid
+            `);
+
+        // 4. إرسال رابط التفعيل الجديد
+        const verifyLink = `http://localhost:3000/api/auth/verify-email?token=${newToken}`;
+        await transporter.sendMail({
+            from: `"Adrenaline Security" <${process.env.EMAIL_USER}>`,
+            to: newEmail,
+            subject: 'تأكيد تغيير البريد الإلكتروني',
+            html: `<h3>تم تغيير بريدك الإلكتروني</h3><p>يرجى تأكيد البريد الجديد عبر الرابط:</p><a href="${verifyLink}">تفعيل الحساب</a>`
+        });
+
+        res.json({ status: 'success', message: 'تم تغيير البريد. يرجى تفعيل البريد الجديد من صندوق الوارد.' });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'حدث خطأ أثناء تغيير البريد' });
     }
 };
 // 7. تنفيذ تغيير كلمة المرور (كما هو في نسختك)

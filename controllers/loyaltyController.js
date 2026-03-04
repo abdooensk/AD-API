@@ -70,6 +70,7 @@ exports.getMyLoyaltyStats = async (req, res) => {
 };
 
 // 2. استلام المكافأة اليومية (Daily Check-in)
+// 2. استلام المكافأة اليومية (Daily Check-in) - نسخة محسنة
 exports.claimDailyReward = async (req, res) => {
     const userNo = req.user.userNo;
     const { rewardType } = req.body; 
@@ -79,57 +80,97 @@ exports.claimDailyReward = async (req, res) => {
     try {
         const pool = await poolPromise;
         
-        // جلب البيانات الحالية
+        // 1. جلب آخر تاريخ استلام
         const attRes = await pool.request().input('uid', userNo).query(`
-            SELECT ConsecutiveDays, LoginRewardClaimed, LastClaimDate 
+            SELECT ConsecutiveDays, LastClaimDate 
             FROM AdrenalineWeb.dbo.Web_DailyAttendance WHERE UserNo = @uid
         `);
         
         const att = attRes.recordset[0];
-        if (att && att.LoginRewardClaimed) {
-            return res.status(400).json({ message: 'لقد استلمت مكافأة اليوم بالفعل' });
+        
+        let newDays = 1; // القيمة الافتراضية لليوم الأول
+        let isStreakBroken = false;
+
+        if (att) {
+            const lastDate = new Date(att.LastClaimDate);
+            const today = new Date();
+            
+            // تصفير الوقت للمقارنة بالأيام فقط
+            lastDate.setHours(0,0,0,0);
+            today.setHours(0,0,0,0);
+
+            const diffTime = Math.abs(today - lastDate);
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+            if (diffDays === 0) {
+                return res.status(400).json({ message: 'لقد استلمت مكافأة اليوم بالفعل، عد غداً!' });
+            } else if (diffDays === 1) {
+                // حضر أمس، واليوم حضر -> استمرار السلسلة
+                newDays = att.ConsecutiveDays + 1;
+            } else {
+                // غاب أكثر من يوم -> كسر السلسلة والعودة لليوم 1
+                newDays = 1;
+                isStreakBroken = true;
+            }
         }
 
+        // بدء المعاملة (Transaction)
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
 
         try {
             const reqTx = new sql.Request(transaction);
-            
-            // 1. زيادة الأيام المتتالية +1
-            let newDays = (att.ConsecutiveDays || 0) + 1;
             let message = `تم تسجيل حضورك لليوم ${newDays} على التوالي!`;
-            let loyaltyPointsToAdd = 0;
+            
+            if (isStreakBroken && att) {
+                message = `لقد انقطعت عن الحضور! عاد العداد إلى اليوم 1.`;
+            }
 
-            // 2. التحقق من اكتمال أسبوع (كل 7 أيام)
+            // 2. معالجة المكافآت (كل 7 أيام نقطة ولاء)
+            let loyaltyPointsToAdd = 0;
             if (newDays % 7 === 0) {
                 loyaltyPointsToAdd = 1;
-                message += " 💎 مبروك! حصلت على نقطة ولاء إضافية لإكمالك أسبوعاً.";
+                message += " 💎 مبروك! أكملت أسبوعاً وحصلت على نقطة ولاء.";
             }
 
-            // 3. تحديث جدول الحضور
-            await reqTx.query(`
-                UPDATE AdrenalineWeb.dbo.Web_DailyAttendance 
-                SET ConsecutiveDays = ${newDays}, 
-                    LoginRewardClaimed = 1, 
-                    LastClaimDate = GETDATE() 
-                WHERE UserNo = ${userNo}
-            `);
+            // 3. تحديث أو إدراج في جدول الحضور (Upsert Logic)
+            if (att) {
+                await reqTx.query(`
+                    UPDATE AdrenalineWeb.dbo.Web_DailyAttendance 
+                    SET ConsecutiveDays = ${newDays}, 
+                        LastClaimDate = GETDATE() 
+                    WHERE UserNo = ${userNo}
+                `);
+            } else {
+                // مستخدم جديد يسجل لأول مرة
+                await reqTx.query(`
+                    INSERT INTO AdrenalineWeb.dbo.Web_DailyAttendance (UserNo, ConsecutiveDays, LastClaimDate)
+                    VALUES (${userNo}, 1, GETDATE())
+                `);
+                message = "مرحباً بك! تم تسجيل حضورك لليوم الأول.";
+            }
 
-            // 4. منح نقطة الولاء (إذا أكمل أسبوعاً)
+            // 4. منح نقطة الولاء (إذا استحقها)
             if (loyaltyPointsToAdd > 0) {
                 await reqTx.query(`UPDATE AuthDB.dbo.T_Account SET LoyaltyPoints = LoyaltyPoints + ${loyaltyPointsToAdd} WHERE UserNo = ${userNo}`);
+                
                 // تسجيل اللوج
-                await reqTx.query(`INSERT INTO AdrenalineWeb.dbo.Web_LoyaltyLog (UserNo, PointsSpent, RewardType, RewardAmount, Date) VALUES (${userNo}, 0, 'WEEKLY_STREAK', 1, GETDATE())`);
+                await reqTx.query(`
+                    INSERT INTO AdrenalineWeb.dbo.Web_LoyaltyLog (UserNo, PointsSpent, RewardType, RewardAmount, Date) 
+                    VALUES (${userNo}, 0, 'WEEKLY_STREAK', ${loyaltyPointsToAdd}, GETDATE())
+                `);
             }
 
-            // 5. منح محاولة عجلة الحظ المجانية (تصفير تاريخ آخر استخدام مجاني ليصبح متاحاً)
-            // ملاحظة: المحاولة المجانية تعتمد على مقارنة التاريخ، لذا لا نحتاج لتخزين "رصيد محاولات".
-            // فقط نتأكد أن LastFreeSpinDate في T_Account ليس اليوم.
-            // (سيتم التعامل مع هذا في luckyWheelController)
+            // 5. يمكنك هنا إضافة كود لمنح عنصر (Item) داخل اللعبة بناءً على newDays
+            // مثال: استدعاء دالة تمنح سلاحاً لمدة يوم إذا كان اليوم = 3 (اختياري)
 
             await transaction.commit();
-            res.json({ status: 'success', message, days: newDays });
+            res.json({ 
+                status: 'success', 
+                message, 
+                days: newDays,
+                streakBroken: isStreakBroken
+            });
 
         } catch (err) {
             await transaction.rollback();
@@ -137,7 +178,8 @@ exports.claimDailyReward = async (req, res) => {
         }
 
     } catch (err) {
-        res.status(500).json({ message: 'فشل العملية' });
+        console.error(err);
+        res.status(500).json({ message: 'فشل العملية', error: err.message });
     }
 };
 
@@ -192,15 +234,16 @@ exports.exchangePoints = async (req, res) => {
 exports.getAttendanceList = async (req, res) => {
     try {
         const pool = await poolPromise;
+        // 👈 التعديل هنا: I.RestrictLevel AS Level
         const result = await pool.request().query(`
-            SELECT A.DayCount, A.ItemCount, I.ItemName, I.Level, A.ItemDays
+            SELECT A.DayCount, A.ItemCount, I.ItemName, I.RestrictLevel AS Level, A.ItemDays
             FROM GameDB.dbo.T_Event_Attendance A
             LEFT JOIN GameDB.dbo.T_ItemInfo I ON A.ItemId = I.ItemId
             ORDER BY A.DayCount ASC
         `);
         res.json({ status: 'success', rewards: result.recordset });
     } catch (err) {
-        console.error(err);
+        console.error("Attendance List Error:", err);
         res.status(500).json({ message: 'فشل جلب القائمة' });
     }
 };

@@ -8,7 +8,7 @@ const config = {
     server: process.env.DB_SERVER, 
     database: process.env.DB_NAME,
     options: {
-        encrypt: false, // اجعله true إذا كنت تستخدم Azure Cloud
+        encrypt: process.env.DB_ENCRYPT === 'false', // سيكون true في جوجل كلاود // اجعله true إذا كنت تستخدم Azure Cloud
         trustServerCertificate: true, // ضروري جداً للاتصال المحلي (Localhost)
         enableArithAbort: true
     }
@@ -23,7 +23,6 @@ const poolPromise = new sql.ConnectionPool(config)
     })
     .catch(err => {
         console.error('❌ Database Connection Failed! Error: ', err);
-        process.exit(1); // إيقاف السيرفر في حال فشل الاتصال
     });
 
 module.exports = {

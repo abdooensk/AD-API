@@ -1,5 +1,10 @@
 const { poolPromise, sql } = require('../config/db');
+const crypto = require('crypto'); // 👈 ضروري لتشفير كلمات المرور
 
+// دالة مساعدة لتشفير كلمة المرور (يجب أن تطابق المستخدمة في authController)
+const hashPassword = (password) => {
+    return crypto.createHash('sha512').update(password).digest('hex').toUpperCase();
+};
 
 // 1. جلب بيانات البروفايل
 exports.getProfile = async (req, res) => {
@@ -23,9 +28,9 @@ exports.getProfile = async (req, res) => {
                     U.RegDate,
                     (SELECT TOP 1 C.ClanName FROM ClanDB.dbo.T_Clan C WHERE C.ClanNo = U.ClanNo) AS ClanName,
                     
-                    -- 👇 جلب نقاط الولاء (LoyaltyPoints) من جدول الحسابات
-                    -- استخدام ISNULL لضمان إرجاع 0 إذا كانت القيمة NULL
-                    ISNULL((SELECT TOP 1 A.LoyaltyPoints FROM AuthDB.dbo.T_Account A WHERE A.UserNo = U.UserNo), 0) AS LoyaltyPoints                FROM GameDB.dbo.T_User U
+                    -- جلب نقاط الولاء (LoyaltyPoints)
+                    ISNULL((SELECT TOP 1 A.LoyaltyPoints FROM AuthDB.dbo.T_Account A WHERE A.UserNo = U.UserNo), 0) AS LoyaltyPoints
+                FROM GameDB.dbo.T_User U
                 WHERE U.UserNo = @id
             `);
 
@@ -53,7 +58,7 @@ exports.getProfile = async (req, res) => {
     }
 };
 
-// 2. تغيير كلمة المرور
+// 2. تغيير كلمة المرور (مع التشفير 🔒)
 exports.changePassword = async (req, res) => {
     const { oldPassword, newPassword } = req.body;
     const userNo = req.user.userNo;
@@ -79,13 +84,17 @@ exports.changePassword = async (req, res) => {
             return res.status(404).json({ message: 'الحساب غير موجود' });
         }
 
-        if (currentAccount.Password !== oldPassword) {
+        // 1. التحقق من القديمة (مشفّرة)
+        const oldHash = hashPassword(oldPassword);
+        if (currentAccount.Password !== oldHash) {
             return res.status(400).json({ message: 'كلمة المرور القديمة غير صحيحة' });
         }
 
+        // 2. تحديث الجديدة (مشفّرة)
+        const newHash = hashPassword(newPassword);
         await pool.request()
             .input('uid', userNo)
-            .input('newPass', newPassword)
+            .input('newPass', newHash)
             .query('UPDATE AuthDB.dbo.T_Account SET Password = @newPass WHERE UserNo = @uid');
 
         res.json({ status: 'success', message: 'تم تغيير كلمة المرور بنجاح' });
@@ -96,7 +105,7 @@ exports.changePassword = async (req, res) => {
     }
 };
 
-// 3. عرض حالة الحظر (جديد)
+// 3. عرض حالة الحظر
 exports.getBanStatus = async (req, res) => {
     const userNo = req.user.userNo;
 
@@ -133,20 +142,19 @@ exports.getBanStatus = async (req, res) => {
     }
 };
 
-// 4. طلب فك الحظر (جديد)
+// 4. طلب فك الحظر
 exports.requestUnban = async (req, res) => {
     const userNo = req.user.userNo;
-    const settingsRes = await pool.request()
-    .query("SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'UnbanFine'");
 
     try {
         const pool = await poolPromise;
+        // جلب قيمة الغرامة من الإعدادات
         const settingsRes = await pool.request()
             .query("SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'UnbanFine'");
         
-        // إذا لم يجد قيمة، يضع 5000 كقيمة افتراضية
         const fineAmount = settingsRes.recordset[0] ? parseInt(settingsRes.recordset[0].ConfigValue) : 5000;
 
+        // التحقق من وجود طلب معلق
         const checkPending = await pool.request()
             .input('uid', userNo)
             .query("SELECT * FROM AdrenalineWeb.dbo.Web_UnbanRequests WHERE UserNo = @uid AND Status = 'Pending'");
@@ -155,6 +163,7 @@ exports.requestUnban = async (req, res) => {
             return res.status(400).json({ message: 'لديك طلب قيد المراجعة بالفعل، يرجى الانتظار' });
         }
 
+        // إدراج الطلب
         await pool.request()
             .input('uid', userNo)
             .input('fine', fineAmount)
@@ -167,5 +176,66 @@ exports.requestUnban = async (req, res) => {
 
     } catch (err) {
         res.status(500).json({ message: 'فشل إرسال الطلب', error: err.message });
+    }
+};
+
+// 5. عرض الجلسات النشطة 🆕
+exports.getActiveSessions = async (req, res) => {
+    const userNo = req.user.userNo;
+    const currentSessionId = req.user.sessionId; // القادمة من التوكن الحالي
+
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request()
+            .input('uid', userNo)
+            .query(`
+                SELECT SessionID, IPAddress, DeviceName, LoginDate, LastActive, IsActive 
+                FROM AdrenalineWeb.dbo.Web_LoginSessions 
+                WHERE UserNo = @uid AND IsActive = 1
+                ORDER BY LoginDate DESC
+            `);
+
+        // وضع علامة على الجلسة الحالية
+        const sessions = result.recordset.map(s => ({
+            ...s,
+            isCurrent: s.SessionID === currentSessionId
+        }));
+
+        res.json({ status: 'success', sessions });
+
+    } catch (err) {
+        res.status(500).json({ message: 'فشل جلب الجلسات' });
+    }
+};
+
+// 6. تسجيل الخروج من الجلسات (Revoke) 🆕
+exports.revokeSession = async (req, res) => {
+    const userNo = req.user.userNo;
+    const { sessionId, revokeAll } = req.body; 
+
+    try {
+        const pool = await poolPromise;
+        const reqDb = pool.request().input('uid', userNo);
+
+        if (revokeAll) {
+            // طرد الجميع
+            await reqDb.query("UPDATE AdrenalineWeb.dbo.Web_LoginSessions SET IsActive = 0 WHERE UserNo = @uid");
+            res.json({ status: 'success', message: 'تم تسجيل الخروج من جميع الأجهزة' });
+        } else {
+            if (!sessionId) return res.status(400).json({ message: 'رقم الجلسة مطلوب' });
+            
+            // طرد جهاز محدد
+            reqDb.input('sid', sessionId);
+            const result = await reqDb.query("UPDATE AdrenalineWeb.dbo.Web_LoginSessions SET IsActive = 0 WHERE UserNo = @uid AND SessionID = @sid");
+            
+            if (result.rowsAffected[0] === 0) {
+                 return res.status(404).json({ message: 'الجلسة غير موجودة أو منتهية' });
+            }
+
+            res.json({ status: 'success', message: 'تم إنهاء الجلسة بنجاح' });
+        }
+
+    } catch (err) {
+        res.status(500).json({ message: 'فشل العملية' });
     }
 };

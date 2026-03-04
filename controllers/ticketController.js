@@ -77,6 +77,8 @@ exports.getMyTickets = async (req, res) => {
 };
 
 // 3. عرض تفاصيل تذكرة وردودها
+// 3. عرض تفاصيل تذكرة وردودها (نسخة مصححة)
+// 3. عرض تفاصيل تذكرة وردودها (نسخة مصححة الترميز)
 exports.getTicketDetails = async (req, res) => {
     const { id } = req.params;
     const userNo = req.user.userNo;
@@ -84,7 +86,7 @@ exports.getTicketDetails = async (req, res) => {
     try {
         const pool = await poolPromise;
         
-        // جلب التذكرة (للتأكد أنها ملك للاعب)
+        // 1. جلب التذكرة
         const ticketCheck = await pool.request()
             .input('tid', id)
             .input('uid', userNo)
@@ -94,10 +96,28 @@ exports.getTicketDetails = async (req, res) => {
             return res.status(404).json({ message: 'التذكرة غير موجودة' });
         }
 
-        // جلب الردود
+        // 2. جلب الردود (إصلاح علامات الاستفهام بإضافة N)
         const replies = await pool.request()
             .input('tid', id)
-            .query("SELECT * FROM AdrenalineWeb.dbo.Web_TicketReplies WHERE TicketID = @tid ORDER BY ReplyDate ASC");
+            .query(`
+                SELECT 
+                    R.ReplyID, 
+                    R.TicketID, 
+                    R.UserNo, 
+                    R.Message, 
+                    R.AttachmentURL, 
+                    R.ReplyDate, 
+                    R.IsAdminReply,
+                    CASE 
+                        WHEN R.IsAdminReply = 1 THEN N'الدعم الفني'  -- 👈 لاحظ حرف N هنا
+                        ELSE ISNULL(U.Nickname, N'اللاعب')          -- 👈 وهنا أيضاً
+                    END AS SenderName,
+                    U.UserId AS Username
+                FROM AdrenalineWeb.dbo.Web_TicketReplies R
+                LEFT JOIN GameDB.dbo.T_User U ON R.UserNo = U.UserNo
+                WHERE R.TicketID = @tid
+                ORDER BY R.ReplyDate ASC
+            `);
 
         res.json({ 
             status: 'success', 
@@ -106,6 +126,7 @@ exports.getTicketDetails = async (req, res) => {
         });
 
     } catch (err) {
+        console.error(err);
         res.status(500).json({ message: 'خطأ في جلب التفاصيل' });
     }
 };

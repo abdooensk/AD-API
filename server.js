@@ -23,7 +23,8 @@ const walletRoutes = require('./routes/walletRoutes');
 const luckyWheelRoutes = require('./routes/luckyWheelRoutes');
 const cosmeticRoutes = require('./routes/cosmeticRoutes');
 const paypalRoutes = require('./routes/paypalRoutes');
-
+const serverRoutes = require('./routes/serverRoutes');
+const launcherRoutes = require('./routes/launcherRoutes');
 // 👇 تم التصحيح: استدعاء الملف في سطر منفصل
 const startCronJobs = require('./utils/cronJobs'); 
 
@@ -40,6 +41,7 @@ app.use(hpp());
 app.use(morgan('dev'));
 
 // 2. تفعيل الروابط
+app.use('/api/server', serverRoutes); // 👈 هذا سيجعل رابط /api/server/status يعمل
 app.use('/api/auth', authRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/inventory', inventoryRoutes);
@@ -59,6 +61,7 @@ app.use('/api/tickets', require('./routes/ticketRoutes'));
 app.use('/public', express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
 app.use('/public', express.static(path.join(__dirname, 'public')));
+app.use('/api/launcher', launcherRoutes);
 // 3. فحص السيرفر
 
 app.get('/', (req, res) => {
@@ -66,11 +69,11 @@ app.get('/', (req, res) => {
 });
 
 // تشغيل الـ Cron Jobs
-startCronJobs(); 
-
+// startCronJobs();
 // 4. تشغيل السيرفر
-const PORT = process.env.PORT || 2000;
-app.listen(PORT, () => {
+// 4. تشغيل السيرفر
+const PORT = process.env.PORT || 8080; // من الأفضل جعله 8080 ليتوافق مع Cloud Run
+app.listen(PORT, '0.0.0.0', () => {  // 👈 إضافة '0.0.0.0' ضرورية جداً هنا
     console.log(`\n===================================================`);
     console.log(`✅ SERVER STARTED ON PORT: ${PORT}`);
     console.log(`⏰ Cron Jobs Active`);

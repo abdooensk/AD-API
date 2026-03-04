@@ -287,3 +287,116 @@ exports.getServerEconomy = async (req, res) => {
     }
 };
 };
+exports.getAllTickets = async (req, res) => {
+    const { status } = req.query; // ?status=OPEN
+
+    try {
+        const pool = await poolPromise;
+        let query = `
+            SELECT T.TicketID, T.UserNo, T.Category, T.Title, T.Status, T.Priority, T.CreatedDate, T.LastUpdate,
+                   U.UserId AS Username, U.Nickname 
+            FROM AdrenalineWeb.dbo.Web_Tickets T
+            JOIN GameDB.dbo.T_User U ON T.UserNo = U.UserNo
+        `;
+        
+        // فلترة حسب الحالة
+        if (status && status !== 'ALL') {
+            query += ` WHERE T.Status = @status`;
+        }
+        
+        query += ` ORDER BY T.LastUpdate DESC`; // الأحدث أولاً
+
+        const request = pool.request();
+        if (status && status !== 'ALL') request.input('status', status);
+
+        const result = await request.query(query);
+        res.json({ status: 'success', tickets: result.recordset });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'خطأ في جلب التذاكر' });
+    }
+};
+
+// 5. عرض تفاصيل تذكرة معينة (مع الردود)
+exports.getTicketDetailsAdmin = async (req, res) => {
+    const { id } = req.params;
+    try {
+        const pool = await poolPromise;
+        
+        // أ. جلب التذكرة الأساسية
+        const ticketRes = await pool.request().input('tid', id).query(`
+            SELECT T.*, U.UserId, U.Nickname 
+            FROM AdrenalineWeb.dbo.Web_Tickets T
+            JOIN GameDB.dbo.T_User U ON T.UserNo = U.UserNo
+            WHERE T.TicketID = @tid
+        `);
+
+        if (ticketRes.recordset.length === 0) return res.status(404).json({ message: 'التذكرة غير موجودة' });
+
+        // ب. جلب الردود
+        const repliesRes = await pool.request().input('tid', id).query(`
+            SELECT R.*, 
+                   CASE WHEN R.IsAdminReply = 1 THEN 'GM' ELSE U.Nickname END AS SenderName
+            FROM AdrenalineWeb.dbo.Web_TicketReplies R
+            LEFT JOIN GameDB.dbo.T_User U ON R.UserNo = U.UserNo
+            WHERE R.TicketID = @tid
+            ORDER BY R.ReplyDate ASC
+        `);
+
+        res.json({ 
+            status: 'success', 
+            ticket: ticketRes.recordset[0], 
+            replies: repliesRes.recordset 
+        });
+
+    } catch (err) {
+        res.status(500).json({ message: 'خطأ في جلب التفاصيل' });
+    }
+};
+
+// 6. رد الأدمن على تذكرة
+exports.adminReplyTicket = async (req, res) => {
+    const { id } = req.params;
+    const { message, closeTicket } = req.body; // closeTicket: "true" or "false"
+    
+    // صورة المرفق (إذا وجدت)
+    const attachmentUrl = req.file ? `/uploads/tickets/${req.file.filename}` : null;
+
+    if (!message && !attachmentUrl) return res.status(400).json({ message: 'يجب كتابة رد أو إرفاق صورة' });
+
+    try {
+        const pool = await poolPromise;
+        const newStatus = (closeTicket === 'true' || closeTicket === true) ? 'CLOSED' : 'ADMIN_REPLY';
+
+        await pool.request()
+            .input('tid', id)
+            .input('msg', message || '')
+            .input('attach', attachmentUrl)
+            .input('status', newStatus)
+            .query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_TicketReplies (TicketID, UserNo, IsAdminReply, Message, AttachmentURL)
+                VALUES (@tid, 0, 1, @msg, @attach); -- UserNo 0 for System/Admin
+
+                UPDATE AdrenalineWeb.dbo.Web_Tickets 
+                SET Status = @status, LastUpdate = GETDATE() 
+                WHERE TicketID = @tid;
+            `);
+
+        res.json({ status: 'success', message: 'تم الرد بنجاح' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'فشل الرد' });
+    }
+};
+
+// 7. إغلاق التذكرة يدوياً
+exports.closeTicket = async (req, res) => {
+    const { id } = req.params;
+    try {
+        const pool = await poolPromise;
+        await pool.request().input('tid', id).query("UPDATE AdrenalineWeb.dbo.Web_Tickets SET Status = 'CLOSED', LastUpdate = GETDATE() WHERE TicketID = @tid");
+        res.json({ status: 'success', message: 'تم إغلاق التذكرة' });
+    } catch (err) {
+        res.status(500).json({ message: 'فشل العملية' });
+    }
+};
