@@ -69,10 +69,10 @@ app.get('/', (req, res) => {
 });
 
 // تشغيل الـ Cron Jobs
-// startCronJobs();
+startCronJobs();
 // 4. تشغيل السيرفر
 // 4. تشغيل السيرفر
-const PORT = process.env.PORT || 8080; // من الأفضل جعله 8080 ليتوافق مع Cloud Run
+const PORT = process.env.PORT || 2000; // من الأفضل جعله 8080 ليتوافق مع Cloud Run
 app.listen(PORT, '0.0.0.0', () => {  // 👈 إضافة '0.0.0.0' ضرورية جداً هنا
     console.log(`\n===================================================`);
     console.log(`✅ SERVER STARTED ON PORT: ${PORT}`);
