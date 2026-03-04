@@ -8,7 +8,7 @@ const config = {
     server: process.env.DB_SERVER, 
     database: process.env.DB_NAME,
     options: {
-        encrypt: process.env.DB_ENCRYPT === 'false', // سيكون true في جوجل كلاود // اجعله true إذا كنت تستخدم Azure Cloud
+        encrypt: process.env.DB_ENCRYPT === 'true', // سيكون true في جوجل كلاود // اجعله true إذا كنت تستخدم Azure Cloud
         trustServerCertificate: true, // ضروري جداً للاتصال المحلي (Localhost)
         enableArithAbort: true
     }

@@ -10,6 +10,17 @@ const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_adrenaline_key_2026';
 
+const maskEmail = (email) => {
+    if (!email) return '';
+    const [localPart, domain] = email.split('@');
+    if (!localPart || !domain) return email;
+    
+    if (localPart.length <= 2) {
+        return `${localPart[0]}***@${domain}`;
+    }
+    return `${localPart.substring(0, 2)}***@${domain}`;
+};
+
 // دالة لتوليد كود تفعيل من 6 أرقام
 const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
 
@@ -472,38 +483,62 @@ exports.changePendingEmail = async (req, res) => {
 // منطقة استعادة كلمة المرور (بدون ملفات HTML خارجية)
 // -------------------------------------------------------------------------
 
-// 6. طلب استعادة كلمة المرور (Forgot Password)
 exports.forgotPassword = async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ message: 'الرجاء إدخال البريد الإلكتروني' });
+    const { username, email } = req.body;
+
+    if (!username && !email) {
+        return res.status(400).json({ message: 'الرجاء إدخال اسم المستخدم أو البريد الإلكتروني' });
+    }
 
     try {
         const pool = await poolPromise;
-        const userCheck = await pool.request().input('email', email).query("SELECT UserNo, UserId FROM AuthDB.dbo.T_Account WHERE Email = @email");
+        let request = pool.request();
+        let queryStr = "";
 
-        if (userCheck.recordset.length === 0) return res.status(404).json({ message: 'البريد الإلكتروني غير مسجل' });
+        if (username) {
+            request.input('uid', username);
+            queryStr = "SELECT UserNo, UserId, Email FROM AuthDB.dbo.T_Account WHERE UserId = @uid";
+        } else {
+            request.input('email', email);
+            queryStr = "SELECT UserNo, UserId, Email FROM AuthDB.dbo.T_Account WHERE Email = @email";
+        }
 
-        const resetCode = generateOTP(); // 👈 توليد كود رقمي
-        const username = userCheck.recordset[0].UserId;
+        const userCheck = await request.query(queryStr);
+
+        if (userCheck.recordset.length === 0) {
+            return res.status(404).json({ message: 'الحساب غير موجود' });
+        }
+
+        const user = userCheck.recordset[0];
+        const targetEmail = user.Email;
+        const targetUsername = user.UserId;
+
+        const resetCode = generateOTP(); 
 
         await pool.request()
             .input('code', resetCode)
-            .input('email', email)
-            .query(`UPDATE AuthDB.dbo.T_Account SET PasswordResetToken = @code, ResetTokenExpiry = DATEADD(HOUR, 1, GETDATE()) WHERE Email = @email`);
+            .input('uNo', user.UserNo)
+            .query(`UPDATE AuthDB.dbo.T_Account SET PasswordResetToken = @code, ResetTokenExpiry = DATEADD(HOUR, 1, GETDATE()) WHERE UserNo = @uNo`);
 
         await transporter.sendMail({
             from: `"Adrenaline Support" <${process.env.EMAIL_USER}>`,
-            to: email,
+            to: targetEmail,
             subject: 'أدرينالين - طلب استعادة كلمة المرور',
             html: getEmailTemplate(
                 'استعادة كلمة المرور', 
-                username, 
+                targetUsername, 
                 'لقد تلقينا طلباً لتغيير كلمة المرور الخاصة بحسابك. هذا الكود صالح لمدة ساعة واحدة فقط:', 
                 resetCode
             )
         });
 
-        res.json({ status: 'success', message: 'تم إرسال كود الاستعادة للإيميل.' });
+        const hiddenEmail = maskEmail(targetEmail);
+
+        res.json({ 
+            status: 'success', 
+            message: 'تم إرسال كود الاستعادة بنجاح.',
+            maskedEmail: hiddenEmail
+        });
 
     } catch (err) {
         console.error(err);
@@ -511,43 +546,45 @@ exports.forgotPassword = async (req, res) => {
     }
 };
 
-// 🆕 7. عرض صفحة تغيير الباسورد (GET Request)
-// هذه الدالة ترسم صفحة HTML مباشرة في المتصفح بدون ملف خارجي
 
-
-
-// 8. تنفيذ التغيير (POST Request) - (نفس الدالة السابقة)
-// 8. تنفيذ تغيير كلمة المرور (مصحح: يقوم بالتشفير الآن)
+// 8. تنفيذ تغيير كلمة المرور (المرنة والمصححة)
 exports.resetPassword = async (req, res) => {
-    const { username, code, newPassword } = req.body;
+    const { username, email, code, newPassword } = req.body;
+    const identifier = username || email;
 
-    if (!username || !code || !newPassword) {
-        return res.status(400).json({ message: 'البيانات ناقصة' });
+    if (!identifier || !code || !newPassword) {
+        return res.status(400).json({ message: 'البيانات ناقصة (يجب إرسال اسم المستخدم أو الإيميل مع الكود)' });
     }
 
     try {
         const pool = await poolPromise;
+        const cleanCode = code.toString().trim();
 
-        // التحقق من صحة الكود وصلاحيته بناءً على اسم المستخدم
         const result = await pool.request()
-            .input('uid', username)
-            .input('code', code)
+            .input('identifier', identifier)
+            .input('code', cleanCode)
             .query(`
                 SELECT UserNo FROM AuthDB.dbo.T_Account 
-                WHERE UserId = @uid AND PasswordResetToken = @code AND ResetTokenExpiry > GETDATE()
+                WHERE (UserId = @identifier OR Email = @identifier) 
+                AND PasswordResetToken = @code 
+                AND ResetTokenExpiry > GETDATE()
             `);
 
         if (result.recordset.length === 0) {
+            console.log(`❌ فشل الاستعادة | المعرف: ${identifier} | الكود المُدخل: "${cleanCode}"`);
             return res.status(400).json({ message: 'الكود خاطئ أو منتهي الصلاحية' });
         }
 
         const hashedPassword = hashPassword(newPassword);
 
-        // التحديث
         await pool.request()
             .input('pass', hashedPassword)
             .input('uNo', result.recordset[0].UserNo)
-            .query("UPDATE AuthDB.dbo.T_Account SET Password = @pass, PasswordResetToken = NULL, ResetTokenExpiry = NULL WHERE UserNo = @uNo");
+            .query(`
+                UPDATE AuthDB.dbo.T_Account 
+                SET Password = @pass, PasswordResetToken = NULL, ResetTokenExpiry = NULL 
+                WHERE UserNo = @uNo
+            `);
 
         res.json({ status: 'success', message: 'تم تغيير كلمة المرور بنجاح' });
 
@@ -556,16 +593,19 @@ exports.resetPassword = async (req, res) => {
         res.status(500).json({ message: 'فشل تغيير كلمة المرور' });
     }
 };
+
+// -------------------------------------------------------------------------
+// دالة تغيير الإيميل 
+// -------------------------------------------------------------------------
 exports.changeEmail = async (req, res) => {
     const { password, newEmail } = req.body;
-    const userNo = req.user.userNo; // تأتي من الـ token عبر الـ middleware
+    const userNo = req.user.userNo; 
 
     if (!password || !newEmail) return res.status(400).json({ message: 'يجب إدخال كلمة المرور والبريد الجديد' });
 
     try {
         const pool = await poolPromise;
 
-        // 1. التحقق من كلمة المرور
         const userCheck = await pool.request()
             .input('uid', userNo)
             .query("SELECT Password FROM AuthDB.dbo.T_Account WHERE UserNo = @uid");
@@ -577,11 +617,9 @@ exports.changeEmail = async (req, res) => {
             return res.status(401).json({ message: 'كلمة المرور غير صحيحة' });
         }
 
-        // 2. التحقق من أن البريد غير مستخدم
         const emailCheck = await pool.request().input('email', newEmail).query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE Email = @email");
         if (emailCheck.recordset.length > 0) return res.status(400).json({ message: 'البريد الإلكتروني مستخدم بالفعل' });
 
-        // 3. تحديث البريد وتوليد كود التفعيل
         const newCode = generateOTP(); 
         
         await pool.request()
@@ -594,14 +632,13 @@ exports.changeEmail = async (req, res) => {
                 WHERE UserNo = @uid
             `);
 
-        // 4. إرسال الكود
         await transporter.sendMail({
             from: `"Adrenaline Security" <${process.env.EMAIL_USER}>`,
             to: newEmail,
             subject: 'أدرينالين - تأكيد تغيير البريد الإلكتروني',
             html: getEmailTemplate(
                 'تأكيد البريد الإلكتروني الجديد', 
-                req.user.userId || 'أيها اللاعب', // في حال لم يكن الـ username متاحاً بسهولة
+                req.user.userId || 'أيها اللاعب', 
                 'لقد قمت بتغيير بريدك الإلكتروني بنجاح. لتفعيل حسابك مرة أخرى وتأمين التغيير، أدخل الكود التالي:', 
                 newCode
             )
@@ -614,4 +651,3 @@ exports.changeEmail = async (req, res) => {
         res.status(500).json({ message: 'حدث خطأ أثناء تغيير البريد' });
     }
 };
-// 7. تنفيذ تغيير كلمة المرور (كما هو في نسختك)

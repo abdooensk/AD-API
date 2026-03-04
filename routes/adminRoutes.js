@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-
+const { uploadTicket } = require('../utils/uploadConfig');
 // 1. استيراد المتحكمات
 const adminController = require('../controllers/adminController'); 
 const adminCosmetic = require('../controllers/adminCosmeticController');
@@ -47,6 +47,11 @@ router.get('/inventory/:userNo', requireRole(5), adminInventory.getPlayerInvento
 // 👑 صلاحيات المدير العام (Admin) - Grade 10
 // ==========================================
 // إدارة السيرفر والأدوات الحساسة
+// ==========================================
+router.get('/tickets/list', requireRole(5), adminController.getAllTickets); // عرض الكل
+router.get('/tickets/:id', requireRole(5), adminController.getTicketDetailsAdmin); // تفاصيل
+router.post('/tickets/:id/reply', requireRole(5), uploadTicket.single('image'), adminController.adminReplyTicket); // رد (يدعم الصور)
+router.put('/tickets/:id/close', requireRole(5), adminController.closeTicket); // إغلاق
 // داخل قسم صلاحيات الأدمن (Require Role 10)
 router.get('/event/config', requireRole(10), toolsController.getEventConfig);
 router.post('/event/config', requireRole(10), toolsController.updateEventConfig);

@@ -17,25 +17,19 @@ router.post('/register', validate(registerSchema), authController.register);
 // --- روابط تفعيل الحساب ---
 
 // 3. تفعيل الإيميل (رابط يأتي من البريد)
-router.get('/verify-email', authController.verifyEmail);
+router.post('/verify-email', authController.verifyEmail);
 
 // 4. إعادة إرسال كود التفعيل
 router.post('/resend-verification', authController.resendVerification);
 
-// 5. تصحيح الإيميل (في حال أخطأ اللاعب في كتابته)
+// 5. تصحيح الإيميل 
 router.post('/change-pending-email', authController.changePendingEmail);
 
 // --- روابط استعادة كلمة المرور ---
 
-// 6. طلب الاستعادة (يرسل الإيميل)
+// 6. طلب الاستعادة (يرسل كود التفعيل للإيميل)
 router.post('/forgot-password', authController.forgotPassword);
-
-// 7. صفحة الويب لاستعادة كلمة المرور (GET)
-// هذه الصفحة تظهر للمستخدم عند الضغط على الرابط في الإيميل
-router.get('/reset-password-page', authController.getResetPasswordPage);
-
-// 8. تنفيذ تغيير الباسورد (POST)
-// هذا الرابط يستقبل الباسورد الجديد من الصفحة
+// 7. تنفيذ تغيير الباسورد (يستقبل اسم المستخدم، الكود، والباسورد الجديد)
 router.post('/reset-password', authController.resetPassword);
 
 module.exports = router;
