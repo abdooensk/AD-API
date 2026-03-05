@@ -19,31 +19,34 @@ exports.banPlayer = async (req, res) => {
         try {
             const request = new sql.Request(transaction);
 
-            // أ. تفعيل الحظر في جدول الحسابات الأصلي (AuthDB)
-            // (هذا ما يمنعه من دخول اللعبة)
-            await request.query(`UPDATE AuthDB.dbo.T_Account SET IsBanned = 1 WHERE UserNo = ${targetUserNo}`);
+            // تجهيز المتغيرات بأمان مرة واحدة
+            request.input('uid', targetUserNo);
+            request.input('reason', reason);
+            request.input('admin', adminName);
 
-            // ب. تسجيل التفاصيل في موقعنا (للعرض)
-            await request.input('uid', targetUserNo)
-                         .input('reason', reason)
-                         .input('admin', adminName)
-                         .query(`
-                            INSERT INTO AdrenalineWeb.dbo.Web_BanLog (UserNo, Reason, BannedBy, IsActive)
-                            VALUES (@uid, @reason, @admin, 1)
-                         `);
+            // أ. تفعيل الحظر في جدول الحسابات الأصلي
+            await request.query(`UPDATE AuthDB.dbo.T_Account SET IsBanned = 1 WHERE UserNo = @uid`);
+
+            // ب. تسجيل التفاصيل في موقعنا
+            await request.query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_BanLog (UserNo, Reason, BannedBy, IsActive)
+                VALUES (@uid, @reason, @admin, 1)
+            `);
+
+            // ج. طرد اللاعب المحظور من أي جلسة نشطة فوراً!
+            await request.query(`UPDATE AdrenalineWeb.dbo.Web_LoginSessions SET IsActive = 0 WHERE UserNo = @uid`);
 
             await transaction.commit();
-            res.json({ status: 'success', message: 'تم حظر اللاعب بنجاح' });
+            res.json({ status: 'success', message: 'تم حظر اللاعب وطرده من النظام بنجاح' });
 
         } catch (err) {
             await transaction.rollback();
             throw err;
-        }
+        } 
     } catch (err) {
         res.status(500).json({ message: 'فشل الحظر', error: err.message });
     }
 };
-
 // 2. عرض طلبات فك الحظر (Unban Requests)
 exports.getUnbanRequests = async (req, res) => {
     try {
@@ -87,36 +90,40 @@ exports.approveUnban = async (req, res) => {
         // ملاحظة: نفترض الدفع بـ GP (GameMoney)
         const userCheck = await pool.request()
             .input('uid', banRequest.UserNo)
-            .query('SELECT GameMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid');
+            .query('SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid');
             
-        const currentMoney = userCheck.recordset[0].GameMoney;
+        const currentMoney = userCheck.recordset[0].CashMoney;
 
         if (currentMoney < banRequest.FineAmount) {
-            return res.status(400).json({ message: 'اللاعب لا يملك رصيداً كافياً لدفع الغرامة' });
+            return res.status(400).json({ message: 'اللاعب لا يملك كاش (GP) كافياً لدفع الغرامة' });
         }
 
-        // ج. تنفيذ العملية: خصم المال + فك الحظر
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
 
         try {
             const request = new sql.Request(transaction);
 
-            // 1. خصم الغرامة
+            // تجهيز المتغيرات الآمنة
+            request.input('fine', banRequest.FineAmount);
+            request.input('uid', banRequest.UserNo);
+            request.input('rid', requestId);
+
+            // 1. خصم الغرامة (من CashMoney)
             await request.query(`
                 UPDATE GameDB.dbo.T_User 
-                SET GameMoney = GameMoney - ${banRequest.FineAmount} 
-                WHERE UserNo = ${banRequest.UserNo}
+                SET CashMoney = CashMoney - @fine 
+                WHERE UserNo = @uid
             `);
 
             // 2. فك الحظر في AuthDB
-            await request.query(`UPDATE AuthDB.dbo.T_Account SET IsBanned = 0 WHERE UserNo = ${banRequest.UserNo}`);
+            await request.query(`UPDATE AuthDB.dbo.T_Account SET IsBanned = 0 WHERE UserNo = @uid`);
 
             // 3. تحديث حالة الطلب
-            await request.query(`UPDATE AdrenalineWeb.dbo.Web_UnbanRequests SET Status = 'Approved' WHERE RequestID = ${requestId}`);
+            await request.query(`UPDATE AdrenalineWeb.dbo.Web_UnbanRequests SET Status = 'Approved' WHERE RequestID = @rid`);
 
             // 4. إغلاق سجل الحظر
-            await request.query(`UPDATE AdrenalineWeb.dbo.Web_BanLog SET IsActive = 0 WHERE UserNo = ${banRequest.UserNo}`);
+            await request.query(`UPDATE AdrenalineWeb.dbo.Web_BanLog SET IsActive = 0 WHERE UserNo = @uid`);
 
             await transaction.commit();
             res.json({ status: 'success', message: 'تم فك الحظر وخصم الغرامة بنجاح' });

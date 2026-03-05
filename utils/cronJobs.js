@@ -1,13 +1,13 @@
 const cron = require('node-cron');
-const { poolPromise, sql } = require('../config/db'); // 👈 نقطتين (..) للرجوع للخلف// دالة التنظيف (Cleaning Function)
+const { poolPromise, sql } = require('../config/db');
+
+// 1. دالة تنظيف الزينة المنتهية (تم إصلاح ثغرة الحقن فيها 🔒)
 const cleanupExpiredCosmetics = async () => {
     console.log(`[${new Date().toISOString()}] 🧹 بدء عملية تنظيف الزينة المنتهية...`);
     
     try {
         const pool = await poolPromise;
         
-        // 1. البحث عن العناصر المنتهية والتي ما زالت مجهزة (IsEquipped = 1)
-        // نستخدم GETDATE() لمقارنة الوقت الحالي
         const expiredItems = await pool.request().query(`
             SELECT UC.RowID, UC.UserNo, UC.CosmeticID, U.OriginalNickName, U.Nickname
             FROM AdrenalineWeb.dbo.Web_UserCosmetics UC
@@ -17,25 +17,15 @@ const cleanupExpiredCosmetics = async () => {
         `);
 
         if (expiredItems.recordset.length === 0) {
-            console.log('✅ لا توجد عناصر منتهية حالياً.');
-            return;
+            return; // إزالة رسالة "لا توجد عناصر" لمنع الإزعاج في الكونسول كل ساعة
         }
 
         console.log(`⚠️ تم العثور على ${expiredItems.recordset.length} عنصر منتهي. جاري الإزالة...`);
 
-        // 2. معالجة كل عنصر
         for (const item of expiredItems.recordset) {
-            const userNo = item.UserNo;
-            const rowId = item.RowID;
-            
-            // استعادة الاسم الأصلي
-            // إذا كان OriginalNickName فارغاً (خطأ بيانات قديم)، نستخدم Nickname الحالي كحل مؤقت
-            // لكن الأصح هو الاعتماد على OriginalNickName المحفوظ عند التجهيز
             let nameToRestore = item.OriginalNickName;
             
             if (!nameToRestore) {
-                // محاولة تنظيف الاسم يدوياً إذا فقدنا الاسم الأصلي
-                // مثلاً إزالة الأكواد مثل [#cFF0000] أو [Admin]
                 nameToRestore = item.Nickname.replace(/\[#c[0-9A-Fa-f]{6}\]/g, '').replace(/\[.*?\]/g, ''); 
             }
 
@@ -45,32 +35,62 @@ const cleanupExpiredCosmetics = async () => {
             try {
                 const req = new sql.Request(transaction);
 
-                // أ. إلغاء التجهيز في الويب
-                await req.query(`UPDATE AdrenalineWeb.dbo.Web_UserCosmetics SET IsEquipped = 0 WHERE RowID = ${rowId}`);
+                // 🔒 التعديل هنا: استخدام .input() لمنع أخطاء الأسماء التي تحتوي على رموز
+                await req
+                    .input('rowId', item.RowID)
+                    .query("UPDATE AdrenalineWeb.dbo.Web_UserCosmetics SET IsEquipped = 0 WHERE RowID = @rowId");
 
-                // ب. استعادة الاسم في اللعبة
-                await req.query(`UPDATE GameDB.dbo.T_User SET Nickname = N'${nameToRestore}' WHERE UserNo = ${userNo}`);
+                await req
+                    .input('nickname', nameToRestore)
+                    .input('userNo', item.UserNo)
+                    .query("UPDATE GameDB.dbo.T_User SET Nickname = @nickname WHERE UserNo = @userNo");
 
                 await transaction.commit();
-                console.log(`✔ تم استعادة اسم اللاعب: ${userNo}`);
+                console.log(`✔ تم استعادة اسم اللاعب: ${item.UserNo}`);
 
             } catch (err) {
                 await transaction.rollback();
-                console.error(`❌ فشل تنظيف العنصر ${rowId} للاعب ${userNo}:`, err.message);
+                console.error(`❌ فشل تنظيف العنصر للاعب ${item.UserNo}:`, err.message);
             }
         }
 
     } catch (err) {
-        console.error('🔥 خطأ في Cron Job:', err.message);
+        console.error('🔥 خطأ في تنظيف الزينة:', err.message);
     }
 };
 
-// تشغيل المهمة:
-// النجوم تعني: (ثانية دقيقة ساعة يوم شهر يوم_أسبوع)
-// '0 * * * *' تعني عند الدقيقة 0 من كل ساعة (مرة كل ساعة)
+// 🆕 2. دالة تنظيف الجلسات الميتة (للحفاظ على سرعة السيرفر)
+const cleanupDeadSessions = async () => {
+    console.log(`[${new Date().toISOString()}] 🧹 بدء عملية تنظيف الجلسات الميتة...`);
+    
+    try {
+        const pool = await poolPromise;
+        
+        // نحذف الجلسات التي مر عليها أكثر من 7 أيام (التوكن أصلاً ينتهي بعد يوم)
+        // ونحذف الجلسات المسجلة كـ "خروج" (IsActive = 0) ومر عليها أكثر من يوم
+        const result = await pool.request().query(`
+            DELETE FROM AdrenalineWeb.dbo.Web_LoginSessions 
+            WHERE LoginDate < DATEADD(DAY, -7, GETDATE())
+               OR (IsActive = 0 AND LoginDate < DATEADD(DAY, -1, GETDATE()))
+        `);
+
+        if (result.rowsAffected[0] > 0) {
+            console.log(`✅ تم حذف ${result.rowsAffected[0]} جلسة ميتة بنجاح وتخفيف الضغط.`);
+        }
+    } catch (err) {
+        console.error('🔥 خطأ في تنظيف الجلسات:', err.message);
+    }
+};
+
+// 3. تشغيل المهام المجدولة (Cron Jobs)
 const startCronJobs = () => {
+    // تنظيف الزينة: عند الدقيقة 0 من كل ساعة (مرة كل ساعة)
     cron.schedule('0 * * * *', cleanupExpiredCosmetics);
-    console.log('⏰ تم تفعيل نظام التنظيف الآلي (Cron Jobs).');
+    
+    // 🆕 تنظيف الجلسات: كل يوم عند منتصف الليل (00:00)
+    cron.schedule('0 0 * * *', cleanupDeadSessions);
+    
+    console.log('⏰ تم تفعيل نظام التنظيف الآلي (Cron Jobs) بنجاح.');
 };
 
 module.exports = startCronJobs;

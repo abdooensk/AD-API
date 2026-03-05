@@ -94,8 +94,12 @@ exports.buyItem = async (req, res) => {
 
             // ج. خصم المبلغ
             reqTx.input('price', item.PriceGP);
-            await reqTx.query("UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney - @price WHERE UserNo = @uid");
-
+            const deductResult = await reqTx.query("UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney - @price WHERE UserNo = @uid AND GameMoney >= @price");
+            
+            // إذا كانت نتيجة الخصم 0 (أي أن الرصيد لم يكن كافياً لحظة التنفيذ الفعلي)، نلغي العملية
+            if (deductResult.rowsAffected[0] === 0) {
+                throw new Error('رصيدك غير كافٍ لإتمام هذه العملية (تم منع محاولة تلاعب).');
+            }
             // د. إضافة العنصر
             const endDateQuery = item.Duration > 0 ? `DATEADD(DAY, ${item.Duration}, GETDATE())` : `'2099-01-01'`; 
             const sealVal = 0; 

@@ -10,8 +10,10 @@ const auth = async (req, res, next) => {
     }
 
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'super_secret_adrenaline_key_2026');
-        
+        if (!process.env.JWT_SECRET) {
+    throw new Error("FATAL ERROR: JWT_SECRET is not defined.");
+}
+const decoded = jwt.verify(token, process.env.JWT_SECRET);
         // 🆕 التحقق من حالة الجلسة في قاعدة البيانات
         if (decoded.sessionId) {
             const pool = await poolPromise;

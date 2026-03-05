@@ -1,4 +1,5 @@
 const { poolPromise, sql } = require('../config/db');
+const crypto = require('crypto'); // 👈 استدعاء مكتبة التشفير الآمنة
 
 // --- دوال مساعدة ---
 
@@ -8,11 +9,11 @@ const generateNumericSerial = () => {
     const gen = (len) => {
         let res = '';
         for (let i = 0; i < len; i++) {
-            res += chars.charAt(Math.floor(Math.random() * chars.length));
+            // استخدام crypto.randomInt بدلاً من Math.random الضعيف
+            res += chars.charAt(crypto.randomInt(0, chars.length)); 
         }
         return res;
     };
-    // النتيجة: 6 رموز - 6 رموز - 4 رموز (أحرف وأرقام)
     return `${gen(6)}-${gen(6)}-${gen(4)}`;
 };
 
@@ -80,7 +81,7 @@ exports.getShopBundles = async (req, res) => {
 };
 
 // =========================================================
-// 2. شراء القسيمة وتوليد الكود الرقمي
+// 2. شراء القسيمة وتوليد الكود الرقمي (النسخة الآمنة 🛡️)
 // =========================================================
 exports.buyBundle = async (req, res) => {
     const { bundleId, makePublic } = req.body;
@@ -112,7 +113,7 @@ exports.buyBundle = async (req, res) => {
 
         try {
             const request = new sql.Request(transaction);
-            const newSerial = generateNumericSerial(); // توليد الكود الرقمي 123456-123456-1234
+            const newSerial = generateNumericSerial(); 
             const targetUserSql = makePublic ? 'NULL' : userNo; 
 
             request.input('price', finalPrice);
@@ -121,7 +122,12 @@ exports.buyBundle = async (req, res) => {
             request.input('bid', bundleId);
             request.input('isPub', makePublic ? 1 : 0);
 
-            await request.query("UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @price WHERE UserNo = @uid");
+            // 👈 1. الخصم الآمن هنا لمنع ثغرة الرصيد السالب
+            const deduct = await request.query("UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @price WHERE UserNo = @uid AND CashMoney >= @price");
+            
+            if (deduct.rowsAffected[0] === 0) {
+                throw new Error('رصيدك غير كافٍ (تم منع محاولة شراء متزامنة)');
+            }
 
             await request.query(`
                 INSERT INTO GameDB.dbo.T_ItemSerialKey 
@@ -167,7 +173,8 @@ exports.buyBundle = async (req, res) => {
         }
 
     } catch (err) {
-        res.status(500).json({ status: 'error', message: 'فشلت عملية الشراء', error: err.message });
+        const errorMsg = err.message.includes('رصيدك غير كافٍ') ? err.message : 'فشلت عملية الشراء';
+        res.status(400).json({ status: 'error', message: errorMsg, error: err.message });
     }
 };
 
@@ -212,7 +219,7 @@ exports.getMyCoupons = async (req, res) => {
 };
 
 // =========================================================
-// 4. ترقية الكوبون لعام
+// 4. ترقية الكوبون لعام (النسخة الآمنة 🛡️)
 // =========================================================
 exports.upgradeToPublic = async (req, res) => {
     const { serialKey } = req.body;
@@ -244,13 +251,21 @@ exports.upgradeToPublic = async (req, res) => {
             req.input('fee', fee);
             req.input('key', serialKey);
 
-            if (fee > 0) {
-                const deduct = await req.query("UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @fee WHERE UserNo = @uid AND CashMoney >= @fee");
-                if (deduct.rowsAffected[0] === 0) throw new Error('رصيد غير كافٍ');
+            // 👈 1. نقوم بمحاولة تحديث حالة الكوبون أولاً (لضمان أن طلب واحد فقط ينجح)
+            const updateCoupon = await req.query("UPDATE AdrenalineWeb.dbo.Web_UserCoupons SET IsPublic = 1 WHERE SerialKey = @key AND IsPublic = 0");
+            
+            if (updateCoupon.rowsAffected[0] === 0) {
+                throw new Error('هذا الكوبون عام بالفعل أو تمت ترقيته للتو.');
             }
 
+            // 👈 2. إذا نجح التحديث، نخصم الرصيد بأمان
+            if (fee > 0) {
+                const deduct = await req.query("UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @fee WHERE UserNo = @uid AND CashMoney >= @fee");
+                if (deduct.rowsAffected[0] === 0) throw new Error('رصيد غير كافٍ لإتمام الترقية');
+            }
+
+            // 3. تحرير الكوبون في الداتا بيز الخاصة باللعبة
             await req.query("UPDATE GameDB.dbo.T_ItemSerialKey SET TargetUserNo = NULL WHERE SerialKey = @key");
-            await req.query("UPDATE AdrenalineWeb.dbo.Web_UserCoupons SET IsPublic = 1 WHERE SerialKey = @key");
 
             await transaction.commit();
             res.json({ status: 'success', message: 'تمت الترقية بنجاح' });

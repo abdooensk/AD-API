@@ -3,6 +3,8 @@ const cors = require('cors');
 const morgan = require('morgan');
 const hpp = require('hpp');
 const path = require('path'); // 👈 أضف هذا السطر
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const { poolPromise } = require('./config/db');
@@ -29,6 +31,26 @@ const launcherRoutes = require('./routes/launcherRoutes');
 const startCronJobs = require('./utils/cronJobs'); 
 
 const app = express(); // 👈 هذا السطر يجب أن يكون نشطاً وليس تعليقاً
+app.set('trust proxy', 1);
+// 1. تفعيل حماية الترويسات (يمنع ثغرات XSS و Clickjacking)
+app.use(helmet()); 
+
+// 2. إعداد محدد طلبات صارم لعمليات الدخول والتسجيل (يمنع تخمين الباسورد واستنزاف الإيميل)
+const authLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // المدة: ساعة واحدة
+    max: 20, // 20 محاولة فقط لكل IP خلال الساعة
+    message: { message: 'طلبات كثيرة جداً، يرجى المحاولة بعد ساعة.' }
+});
+
+// 3. إعداد محدد طلبات عام لباقي السيرفر (يمنع الضغط العالي)
+const generalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 دقيقة
+    max: 500, // 500 طلب كحد أقصى
+    message: { message: 'تم تجاوز الحد المسموح من الطلبات، يرجى المحاولة لاحقاً.' }
+});
+
+// تطبيق المحدد العام على كل السيرفر
+app.use(generalLimiter);
 
 // 1. إعدادات CORS
 app.use(cors({
@@ -36,13 +58,13 @@ app.use(cors({
     credentials: true
 }));
 
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '5mb' }));
 app.use(hpp());
 app.use(morgan('dev'));
 
 // 2. تفعيل الروابط
 app.use('/api/server', serverRoutes); // 👈 هذا سيجعل رابط /api/server/status يعمل
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', authLimiter, authRoutes); // 👈 تم إضافة الحماية الصارمة هنا
 app.use('/api/user', userRoutes);
 app.use('/api/inventory', inventoryRoutes);
 app.use('/api/shop', shopRoutes);
@@ -60,7 +82,6 @@ app.use('/api/paypal', paypalRoutes);
 app.use('/api/tickets', require('./routes/ticketRoutes'));
 app.use('/public', express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(path.join(__dirname, 'public/uploads')));
-app.use('/public', express.static(path.join(__dirname, 'public')));
 app.use('/api/launcher', launcherRoutes);
 // 3. فحص السيرفر
 

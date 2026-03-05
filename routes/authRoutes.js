@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const authController = require('../controllers/authController');
-
+const auth = require('../middleware/authMiddleware');
 // ✅ تصحيح الاستيراد: يجب وضع { validate } بين أقواس إذا كان التصدير يتم كـ module.exports = { validate }
 const { validate } = require('../middleware/validationMiddleware');
 const { loginSchema, registerSchema } = require('../utils/validators');
@@ -31,5 +31,7 @@ router.post('/change-pending-email', authController.changePendingEmail);
 router.post('/forgot-password', authController.forgotPassword);
 // 7. تنفيذ تغيير الباسورد (يستقبل اسم المستخدم، الكود، والباسورد الجديد)
 router.post('/reset-password', authController.resetPassword);
+router.post('/verify-new-email', auth, authController.verifyNewEmail);
+
 
 module.exports = router;

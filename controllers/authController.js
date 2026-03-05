@@ -8,8 +8,11 @@ const path = require('path'); // لا تنس استدعاء مكتبة path في
 require('dotenv').config(); // 👈 مهم لقراءة الإيميل والباسورد من الملف السري
 const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_adrenaline_key_2026';
-
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    console.error("FATAL ERROR: JWT_SECRET is not defined in .env file.");
+    process.exit(1); // إيقاف السيرفر فوراً لحماية النظام
+};
 const maskEmail = (email) => {
     if (!email) return '';
     const [localPart, domain] = email.split('@');
@@ -22,8 +25,7 @@ const maskEmail = (email) => {
 };
 
 // دالة لتوليد كود تفعيل من 6 أرقام
-const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
-
+const generateOTP = () => crypto.randomInt(100000, 1000000).toString();
 // دالة مساعدة لتوليد قالب الإيميل بشكل احترافي
 const getEmailTemplate = (title, username, message, otp) => {
     return `
@@ -67,30 +69,34 @@ const transporter = nodemailer.createTransport({
 });
 
 // 1. تسجيل الدخول (Login) - (تم تعديله ليدعم ميزة تغيير الإيميل)
+// 1. تسجيل الدخول (Login) - (يدعم الدخول باسم المستخدم أو الإيميل)
 exports.login = async (req, res) => {
-    const { username, password } = req.body;
+    // 👈 التعديل هنا: نستقبل أي منهما ونعتبره "المُعرّف" (Identifier)
+    const identifier = req.body.username || req.body.email; 
+    const password = req.body.password;
 
-    if (!username || !password) {
-        return res.status(400).json({ message: 'الرجاء إدخال اسم المستخدم وكلمة المرور' });
+    if (!identifier || !password) {
+        return res.status(400).json({ message: 'الرجاء إدخال البريد الإلكتروني أو اسم المستخدم، مع كلمة المرور' });
     }
 
     try {
         const pool = await poolPromise;
         
         // 1. جلب بيانات المستخدم
+        // 👈 التعديل هنا: نستخدم OR للبحث في كلا العمودين (UserId أو Email)
         const result = await pool.request()
-            .input('uid', username)
+            .input('identifier', identifier)
             .query(`
                 SELECT A.UserNo, A.UserId, A.Password, A.IsBanned, A.IsEmailVerified, A.Email,
                        U.GMGrade, U.Nickname 
                 FROM AuthDB.dbo.T_Account A
                 LEFT JOIN GameDB.dbo.T_User U ON A.UserNo = U.UserNo 
-                WHERE A.UserId = @uid
+                WHERE A.UserId = @identifier OR A.Email = @identifier
             `);
 
         const user = result.recordset[0];
 
-        if (!user) return res.status(404).json({ message: 'اسم المستخدم غير موجود' });
+        if (!user) return res.status(404).json({ message: 'البيانات غير صحيحة (الحساب غير موجود)' });
         
         // 2. التحقق من كلمة المرور
         const inputHash = hashPassword(password);
@@ -108,13 +114,12 @@ exports.login = async (req, res) => {
         }
 
         // ============================================================
-        // 🆕 4. منطق الحضور المتواصل (Consecutive Attendance Logic)
+        // 4. منطق الحضور المتواصل (Consecutive Attendance Logic)
         // ============================================================
         try {
             const todayDate = new Date().toISOString().split('T')[0];
             const yesterdayDate = new Date(Date.now() - 86400000).toISOString().split('T')[0];
 
-            // التحقق من سجل الحضور
             const attendanceCheck = await pool.request()
                 .input('u_no', user.UserNo)
                 .query("SELECT LastClaimDate FROM AdrenalineWeb.dbo.Web_DailyAttendance WHERE UserNo = @u_no");
@@ -127,19 +132,21 @@ exports.login = async (req, res) => {
                     lastDateStr = new Date(lastClaimDate).toISOString().split('T')[0];
                 }
 
-                // إذا فاته يوم (لم يدخل اليوم ولم يدخل أمس)، نصفر العداد
                 if (lastDateStr !== todayDate && lastDateStr !== yesterdayDate) {
-                    await pool.request().query(`
+                    await pool.request()
+                        .input('uid_update', user.UserNo)
+                        .query(`
                         UPDATE AdrenalineWeb.dbo.Web_DailyAttendance 
                         SET ConsecutiveDays = 0, LoginRewardClaimed = 0 
-                        WHERE UserNo = ${user.UserNo}
+                        WHERE UserNo = @uid_update
                     `);
                 }
             } else {
-                // مستخدم جديد: ننشئ له سجلاً مع وضع تاريخ "أمس" ليتمكن من استلام المكافأة فوراً
-                await pool.request().query(`
+                await pool.request()
+                    .input('uid_insert', user.UserNo)
+                    .query(`
                     INSERT INTO AdrenalineWeb.dbo.Web_DailyAttendance (UserNo, ConsecutiveDays, LoginRewardClaimed, LastClaimDate) 
-                    VALUES (${user.UserNo}, 0, 0, DATEADD(day, -1, GETDATE()))
+                    VALUES (@uid_insert, 0, 0, DATEADD(day, -1, GETDATE()))
                 `);
             }
         } catch (attErr) {
@@ -147,18 +154,12 @@ exports.login = async (req, res) => {
         }
 
         // ============================================================
-        // 🆕 5. إدارة الجلسات (Session Management) - للأمان
+        // 5. إدارة الجلسات (Session Management) - للأمان
         // ============================================================
-        
-        // أ. إنشاء معرف للجلسة
         const sessionId = uuidv4();
-        
-        // ب. الحصول على معلومات الجهاز و IP
         const userAgent = req.headers['user-agent'] || 'Unknown Device';
-        // محاولة جلب IP الحقيقي في حال وجود بروكسي، أو العنوان المباشر
         const userIP = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress;
 
-        // ج. حفظ الجلسة في قاعدة البيانات
         await pool.request()
             .input('sid', sessionId)
             .input('uid', user.UserNo)
@@ -172,7 +173,6 @@ exports.login = async (req, res) => {
         // ============================================================
         // 6. إصدار التوكن (JWT)
         // ============================================================
-        
         const isBanned = user.IsBanned === 1 || user.IsBanned === true;
         
         const token = jwt.sign(
@@ -182,7 +182,7 @@ exports.login = async (req, res) => {
                 isAdmin: user.GMGrade >= 1, 
                 role: user.GMGrade, 
                 isBanned: isBanned,
-                sessionId: sessionId // 👈 إضافة رقم الجلسة للتوكن
+                sessionId: sessionId 
             },
             JWT_SECRET, { expiresIn: '24h' }
         );
@@ -193,7 +193,7 @@ exports.login = async (req, res) => {
             token: token,
             user: {
                 userNo: user.UserNo,
-                username: user.UserId,
+                username: user.UserId, // دائماً نرجع اسم المستخدم للواجهة (حتى لو دخل بالإيميل)
                 nickname: user.Nickname || null,
                 isGM: user.GMGrade >= 1,
                 grade: user.GMGrade,
@@ -222,9 +222,16 @@ exports.register = async (req, res) => {
         // 1. التحقق من التكرار
         const check = await pool.request()
             .input('uid', username)
+            .input('pass', hashedPassword)
             .input('email', email)
-            .query('SELECT UserId FROM AuthDB.dbo.T_Account WHERE UserId = @uid OR Email = @email');
-        
+            .input('token', verificationCode) 
+            .input('ref', referrerUserNo) 
+            .query(`
+                INSERT INTO AuthDB.dbo.T_Account 
+                (UserId, Password, Email, IsEmailVerified, VerificationToken, VerificationTokenExpiry, ReferredBy, RegDate, IsBanned)
+                VALUES 
+                (@uid, @pass, @email, 0, @token, DATEADD(MINUTE, 30, GETDATE()), @ref, GETDATE(), 0)
+            `);
         if (check.recordset.length > 0) {
             return res.status(400).json({ message: 'اسم المستخدم أو البريد مسجل مسبقاً' });
         }
@@ -301,7 +308,9 @@ exports.verifyEmail = async (req, res) => {
             .query(`
                 SELECT UserNo, UserId, IsEmailVerified, ReferredBy 
                 FROM AuthDB.dbo.T_Account 
-                WHERE UserId = @uid AND VerificationToken = @code
+                WHERE UserId = @uid 
+                AND VerificationToken = @code 
+                AND VerificationTokenExpiry > GETDATE()
             `);
 
         const user = checkResult.recordset[0];
@@ -318,7 +327,7 @@ exports.verifyEmail = async (req, res) => {
             // تفعيل الحساب وتفريغ الكود
             await request.input('uNo', user.UserNo).query(`
                 UPDATE AuthDB.dbo.T_Account 
-                SET IsEmailVerified = 1, VerificationToken = NULL 
+                SET IsEmailVerified = 1, VerificationToken = NULL, VerificationTokenExpiry = NULL 
                 WHERE UserNo = @uNo
             `);
 
@@ -577,14 +586,38 @@ exports.resetPassword = async (req, res) => {
 
         const hashedPassword = hashPassword(newPassword);
 
-        await pool.request()
-            .input('pass', hashedPassword)
-            .input('uNo', result.recordset[0].UserNo)
-            .query(`
-                UPDATE AuthDB.dbo.T_Account 
-                SET Password = @pass, PasswordResetToken = NULL, ResetTokenExpiry = NULL 
-                WHERE UserNo = @uNo
-            `);
+       const userNoToReset = result.recordset[0].UserNo;
+
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+        
+        try {
+            const request = new sql.Request(transaction);
+            
+            // أ. تغيير كلمة المرور وتفريغ أكواد الاستعادة
+            await request
+                .input('pass', hashedPassword)
+                .input('uNo', userNoToReset)
+                .query(`
+                    UPDATE AuthDB.dbo.T_Account 
+                    SET Password = @pass, PasswordResetToken = NULL, ResetTokenExpiry = NULL 
+                    WHERE UserNo = @uNo
+                `);
+                
+            // ب. 👈 إنهاء جميع الجلسات النشطة لطرد المخترقين
+            await request
+                .input('uNo_session', userNoToReset)
+                .query(`
+                    UPDATE AdrenalineWeb.dbo.Web_LoginSessions 
+                    SET IsActive = 0 
+                    WHERE UserNo = @uNo_session
+                `);
+                
+            await transaction.commit();
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
 
         res.json({ status: 'success', message: 'تم تغيير كلمة المرور بنجاح' });
 
@@ -596,6 +629,9 @@ exports.resetPassword = async (req, res) => {
 
 // -------------------------------------------------------------------------
 // دالة تغيير الإيميل 
+// -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// دالة طلب تغيير الإيميل (النسخة الآمنة)
 // -------------------------------------------------------------------------
 exports.changeEmail = async (req, res) => {
     const { password, newEmail } = req.body;
@@ -617,37 +653,85 @@ exports.changeEmail = async (req, res) => {
             return res.status(401).json({ message: 'كلمة المرور غير صحيحة' });
         }
 
-        const emailCheck = await pool.request().input('email', newEmail).query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE Email = @email");
-        if (emailCheck.recordset.length > 0) return res.status(400).json({ message: 'البريد الإلكتروني مستخدم بالفعل' });
+        // التأكد أن الإيميل غير موجود في الحسابات المؤكدة ولا في الطلبات المعلقة
+        const emailCheck = await pool.request().input('email', newEmail).query("SELECT UserNo FROM AuthDB.dbo.T_Account WHERE Email = @email OR PendingEmail = @email");
+        if (emailCheck.recordset.length > 0) return res.status(400).json({ message: 'البريد الإلكتروني مستخدم بالفعل في حساب آخر' });
 
         const newCode = generateOTP(); 
         
+        // 👈 التعديل الجذري: نحدث PendingEmail بدلاً من Email، ولا نغير IsEmailVerified
         await pool.request()
             .input('uid', userNo)
             .input('email', newEmail)
             .input('code', newCode)
             .query(`
                 UPDATE AuthDB.dbo.T_Account 
-                SET Email = @email, IsEmailVerified = 0, VerificationToken = @code 
+                SET PendingEmail = @email, VerificationToken = @code, VerificationTokenExpiry = DATEADD(MINUTE, 30, GETDATE())
                 WHERE UserNo = @uid
             `);
 
         await transporter.sendMail({
             from: `"Adrenaline Security" <${process.env.EMAIL_USER}>`,
             to: newEmail,
-            subject: 'أدرينالين - تأكيد تغيير البريد الإلكتروني',
+            subject: 'أدرينالين - تأكيد البريد الإلكتروني الجديد',
             html: getEmailTemplate(
                 'تأكيد البريد الإلكتروني الجديد', 
                 req.user.userId || 'أيها اللاعب', 
-                'لقد قمت بتغيير بريدك الإلكتروني بنجاح. لتفعيل حسابك مرة أخرى وتأمين التغيير، أدخل الكود التالي:', 
+                'لقد طلبت تغيير بريدك الإلكتروني. لتأكيد هذا البريد وتفعيله، أدخل الكود التالي:', 
                 newCode
             )
         });
 
-        res.json({ status: 'success', message: 'تم تغيير البريد. يرجى تفعيل البريد الجديد بالكود المرسل لصندوق الوارد.' });
+        res.json({ status: 'success', message: 'تم إرسال كود التفعيل إلى بريدك الجديد. يرجى إدخاله لتأكيد التغيير.' });
 
     } catch (err) {
         console.error(err);
         res.status(500).json({ message: 'حدث خطأ أثناء تغيير البريد' });
+    }
+};
+
+// -------------------------------------------------------------------------
+// دالة تأكيد الإيميل الجديد (النسخة الآمنة)
+// -------------------------------------------------------------------------
+exports.verifyNewEmail = async (req, res) => {
+    const { code } = req.body;
+    const userNo = req.user.userNo;
+
+    if (!code) return res.status(400).json({ message: 'الرجاء إدخال كود التفعيل' });
+
+    try {
+        const pool = await poolPromise;
+        const result = await pool.request()
+            .input('uid', userNo)
+            .input('code', code)
+            .query(`
+                SELECT PendingEmail 
+                FROM AuthDB.dbo.T_Account 
+                WHERE UserNo = @uid 
+                  AND VerificationToken = @code 
+                  AND VerificationTokenExpiry > GETDATE()
+                  AND PendingEmail IS NOT NULL
+            `);
+
+        if (result.recordset.length === 0) {
+            return res.status(400).json({ message: 'الكود خاطئ أو منتهي الصلاحية.' });
+        }
+
+        const newEmail = result.recordset[0].PendingEmail;
+
+        // استبدال الإيميل القديم بالجديد وتفريغ البيانات المؤقتة
+        await pool.request()
+            .input('uid', userNo)
+            .input('email', newEmail)
+            .query(`
+                UPDATE AuthDB.dbo.T_Account 
+                SET Email = @email, PendingEmail = NULL, VerificationToken = NULL, VerificationTokenExpiry = NULL 
+                WHERE UserNo = @uid
+            `);
+
+        res.json({ status: 'success', message: 'تم تغيير وتأكيد بريدك الإلكتروني بنجاح.' });
+
+    } catch (err) {
+        res.status(500).json({ message: 'حدث خطأ أثناء التأكيد' });
     }
 };

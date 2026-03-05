@@ -67,7 +67,7 @@ exports.changePassword = async (req, res) => {
         return res.status(400).json({ message: 'يجب إدخال كلمة المرور القديمة والجديدة' });
     }
 
-    if (newPassword.length < 4) {
+    if (newPassword.length < 8) {
         return res.status(400).json({ message: 'كلمة المرور الجديدة قصيرة جداً' });
     }
 
@@ -92,11 +92,30 @@ exports.changePassword = async (req, res) => {
 
         // 2. تحديث الجديدة (مشفّرة)
         const newHash = hashPassword(newPassword);
-        await pool.request()
-            .input('uid', userNo)
-            .input('newPass', newHash)
-            .query('UPDATE AuthDB.dbo.T_Account SET Password = @newPass WHERE UserNo = @uid');
-
+        
+        // استخدام Transaction لضمان تنفيذ العمليتين معاً
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+        
+        try {
+            const request = new sql.Request(transaction);
+            
+            // أ. تغيير كلمة المرور
+            await request
+                .input('uid', userNo)
+                .input('newPass', newHash)
+                .query('UPDATE AuthDB.dbo.T_Account SET Password = @newPass WHERE UserNo = @uid');
+                
+            // ب. 👈 إنهاء جميع الجلسات النشطة لهذا الحساب (طرد الجميع بما فيهم المستخدم الحالي)
+            await request
+                .input('uid_session', userNo)
+                .query('UPDATE AdrenalineWeb.dbo.Web_LoginSessions SET IsActive = 0 WHERE UserNo = @uid_session');
+                
+            await transaction.commit();
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
         res.json({ status: 'success', message: 'تم تغيير كلمة المرور بنجاح' });
 
     } catch (err) {
@@ -143,38 +162,73 @@ exports.getBanStatus = async (req, res) => {
 };
 
 // 4. طلب فك الحظر
+// 4. طلب فك الحظر (النسخة الآمنة - خصم CashMoney)
 exports.requestUnban = async (req, res) => {
     const userNo = req.user.userNo;
 
     try {
         const pool = await poolPromise;
-        // جلب قيمة الغرامة من الإعدادات
+        // 1. جلب قيمة الغرامة من الإعدادات
         const settingsRes = await pool.request()
             .query("SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'UnbanFine'");
         
         const fineAmount = settingsRes.recordset[0] ? parseInt(settingsRes.recordset[0].ConfigValue) : 5000;
 
-        // التحقق من وجود طلب معلق
+        // 2. التحقق من وجود طلب معلق
         const checkPending = await pool.request()
             .input('uid', userNo)
-            .query("SELECT * FROM AdrenalineWeb.dbo.Web_UnbanRequests WHERE UserNo = @uid AND Status = 'Pending'");
+            .query("SELECT RequestID FROM AdrenalineWeb.dbo.Web_UnbanRequests WHERE UserNo = @uid AND Status = 'Pending'");
         
         if (checkPending.recordset.length > 0) {
             return res.status(400).json({ message: 'لديك طلب قيد المراجعة بالفعل، يرجى الانتظار' });
         }
 
-        // إدراج الطلب
-        await pool.request()
+        // 3. التحقق من رصيد اللاعب (👈 التعديل هنا: نتحقق من CashMoney)
+        const userCheck = await pool.request()
             .input('uid', userNo)
-            .input('fine', fineAmount)
-            .query(`
-                INSERT INTO AdrenalineWeb.dbo.Web_UnbanRequests (UserNo, FineAmount, Status)
-                VALUES (@uid, @fine, 'Pending')
-            `);
+            .query("SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid");
 
-        res.json({ status: 'success', message: 'تم إرسال طلب فك الحظر. سيقوم الأدمن بمراجعته وخصم الغرامة.' });
+        if (userCheck.recordset.length === 0) {
+            return res.status(404).json({ message: 'بيانات اللاعب غير موجودة' });
+        }
+
+        const currentMoney = userCheck.recordset[0].CashMoney; // 👈 التعديل هنا
+        if (currentMoney < fineAmount) {
+            return res.status(400).json({ message: `رصيدك غير كافٍ. تحتاج إلى ${fineAmount} كاش (GP) لتقديم الطلب.` });
+        }
+
+        // 4. استخدام Transaction لضمان خصم الرصيد وتسجيل الطلب معاً بدون أخطاء
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const request = new sql.Request(transaction);
+
+            // أ. خصم الغرامة فوراً (👈 التعديل هنا: الخصم من CashMoney)
+            await request
+                .input('uid', userNo)
+                .input('fine', fineAmount)
+                .query("UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @fine WHERE UserNo = @uid");
+
+            // ب. إدراج الطلب في قاعدة البيانات
+            await request
+                .input('uid_req', userNo)
+                .input('fine_req', fineAmount)
+                .query(`
+                    INSERT INTO AdrenalineWeb.dbo.Web_UnbanRequests (UserNo, FineAmount, Status, RequestDate)
+                    VALUES (@uid_req, @fine_req, 'Pending', GETDATE())
+                `);
+
+            await transaction.commit();
+            res.json({ status: 'success', message: 'تم إرسال طلب فك الحظر وخصم كاش الغرامة بنجاح كعربون. سيقوم الأدمن بمراجعته.' });
+
+        } catch (err) {
+            await transaction.rollback();
+            throw err;
+        }
 
     } catch (err) {
+        console.error('Unban Request Error:', err);
         res.status(500).json({ message: 'فشل إرسال الطلب', error: err.message });
     }
 };
@@ -218,9 +272,10 @@ exports.revokeSession = async (req, res) => {
         const reqDb = pool.request().input('uid', userNo);
 
         if (revokeAll) {
-            // طرد الجميع
-            await reqDb.query("UPDATE AdrenalineWeb.dbo.Web_LoginSessions SET IsActive = 0 WHERE UserNo = @uid");
-            res.json({ status: 'success', message: 'تم تسجيل الخروج من جميع الأجهزة' });
+            // طرد الجميع ما عدا الجلسة الحالية 
+            reqDb.input('currentSid', req.user.sessionId);
+            await reqDb.query("UPDATE AdrenalineWeb.dbo.Web_LoginSessions SET IsActive = 0 WHERE UserNo = @uid AND SessionID != @currentSid");
+            res.json({ status: 'success', message: 'تم تسجيل الخروج من جميع الأجهزة الأخرى بنجاح' });
         } else {
             if (!sessionId) return res.status(400).json({ message: 'رقم الجلسة مطلوب' });
             

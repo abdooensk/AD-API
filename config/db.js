@@ -8,10 +8,11 @@ const config = {
     server: process.env.DB_SERVER, 
     database: process.env.DB_NAME,
     options: {
-        encrypt: process.env.DB_ENCRYPT === 'true', // سيكون true في جوجل كلاود // اجعله true إذا كنت تستخدم Azure Cloud
-        trustServerCertificate: true, // ضروري جداً للاتصال المحلي (Localhost)
-        enableArithAbort: true
-    }
+    encrypt: process.env.DB_ENCRYPT === 'true',
+    // نجعلها true فقط إذا لم نكن في بيئة الإنتاج الحقيقية
+    trustServerCertificate: process.env.NODE_ENV !== 'production', 
+    enableArithAbort: true
+}
 };
 
 // إنشاء "مسبح اتصال" (Connection Pool) لضمان السرعة وعدم قطع الاتصال
