@@ -221,20 +221,13 @@ exports.register = async (req, res) => {
 
         // 1. التحقق من التكرار
         const check = await pool.request()
-            .input('uid', username)
-            .input('pass', hashedPassword)
-            .input('email', email)
-            .input('token', verificationCode) 
-            .input('ref', referrerUserNo) 
-            .query(`
-                INSERT INTO AuthDB.dbo.T_Account 
-                (UserId, Password, Email, IsEmailVerified, VerificationToken, VerificationTokenExpiry, ReferredBy, RegDate, IsBanned)
-                VALUES 
-                (@uid, @pass, @email, 0, @token, DATEADD(MINUTE, 30, GETDATE()), @ref, GETDATE(), 0)
-            `);
-        if (check.recordset.length > 0) {
-            return res.status(400).json({ message: 'اسم المستخدم أو البريد مسجل مسبقاً' });
-        }
+    .input('uid', username)
+    .input('email', email)
+    .query('SELECT UserId FROM AuthDB.dbo.T_Account WHERE UserId = @uid OR Email = @email');
+
+if (check.recordset.length > 0) {
+    return res.status(400).json({ message: 'اسم المستخدم أو البريد مسجل مسبقاً' });
+}
 
         // 2. معالجة كود الدعوة (تم تعديلها لتكون آمنة من ثغرات SQL)
         let referrerUserNo = null; 
@@ -253,21 +246,21 @@ exports.register = async (req, res) => {
         }
 
         // 3. الإدخال في قاعدة البيانات
-        const verificationCode = generateOTP(); // 👈 إنشاء كود من 6 أرقام
-        const hashedPassword = hashPassword(password);
+        const verificationCode = generateOTP(); 
+const hashedPassword = hashPassword(password);
 
-        await pool.request()
-            .input('uid', username)
-            .input('pass', hashedPassword)
-            .input('email', email)
-            .input('token', verificationCode) // 👈 تم التصحيح هنا لاستخدام verificationCode
-            .input('ref', referrerUserNo) 
-            .query(`
-                INSERT INTO AuthDB.dbo.T_Account 
-                (UserId, Password, Email, IsEmailVerified, VerificationToken, ReferredBy, RegDate, IsBanned)
-                VALUES 
-                (@uid, @pass, @email, 0, @token, @ref, GETDATE(), 0)
-            `);
+await pool.request()
+    .input('uid', username)
+    .input('pass', hashedPassword)
+    .input('email', email)
+    .input('token', verificationCode) 
+    .input('ref', referrerUserNo) 
+    .query(`
+        INSERT INTO AuthDB.dbo.T_Account 
+        (UserId, Password, Email, IsEmailVerified, VerificationToken, VerificationTokenExpiry, ReferredBy, RegDate, IsBanned)
+        VALUES 
+        (@uid, @pass, @email, 0, @token, DATEADD(MINUTE, 30, GETDATE()), @ref, GETDATE(), 0)
+    `);
 
         // 4. 👈👈 هنا نضع كود إرسال الإيميل (باستخدام القالب الاحترافي)
         await transporter.sendMail({
@@ -385,7 +378,9 @@ await transaction.commit();
 // 🆕 4. دالة جديدة: إعادة إرسال رابط التفعيل (Resend Verification)
 exports.resendVerification = async (req, res) => {
     const { username, password } = req.body; 
-
+    if (!username || !password) {
+        return res.status(400).json({ message: 'اسم المستخدم وكلمة المرور مطلوبان' });
+    }
     try {
         const pool = await poolPromise;
         const userCheck = await pool.request()
@@ -405,10 +400,9 @@ exports.resendVerification = async (req, res) => {
         const newCode = generateOTP(); 
         
         await pool.request()
-            .input('code', newCode)
-            .input('uid', user.UserNo)
-            .query("UPDATE AuthDB.dbo.T_Account SET VerificationToken = @code WHERE UserNo = @uid");
-        
+    .input('code', newCode)
+    .input('uid', user.UserNo)
+    .query("UPDATE AuthDB.dbo.T_Account SET VerificationToken = @code, VerificationTokenExpiry = DATEADD(MINUTE, 30, GETDATE()) WHERE UserNo = @uid");
         await transporter.sendMail({
             from: `"Adrenaline Game" <${process.env.EMAIL_USER}>`,
             to: user.Email,
@@ -431,6 +425,9 @@ exports.resendVerification = async (req, res) => {
 // 🆕 5. دالة جديدة: تصحيح الإيميل وإعادة الإرسال (Change Email & Resend)
 exports.changePendingEmail = async (req, res) => {
     const { username, password, newEmail } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ message: 'اسم المستخدم وكلمة المرور مطلوبان' });
+    }
 
     if (!newEmail) return res.status(400).json({ message: 'يجب إدخال البريد الجديد' });
 
@@ -461,11 +458,10 @@ exports.changePendingEmail = async (req, res) => {
         const newCode = generateOTP(); 
         
         await pool.request()
-            .input('email', newEmail)
-            .input('code', newCode)
-            .input('uid', user.UserNo)
-            .query("UPDATE AuthDB.dbo.T_Account SET Email = @email, VerificationToken = @code WHERE UserNo = @uid");
-
+    .input('email', newEmail)
+    .input('code', newCode)
+    .input('uid', user.UserNo)
+    .query("UPDATE AuthDB.dbo.T_Account SET Email = @email, VerificationToken = @code, VerificationTokenExpiry = DATEADD(MINUTE, 30, GETDATE()) WHERE UserNo = @uid");
         await transporter.sendMail({
             from: `"Adrenaline Game" <${process.env.EMAIL_USER}>`,
             to: newEmail,

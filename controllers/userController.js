@@ -161,74 +161,34 @@ exports.getBanStatus = async (req, res) => {
     }
 };
 
-// 4. طلب فك الحظر
-// 4. طلب فك الحظر (النسخة الآمنة - خصم CashMoney)
 exports.requestUnban = async (req, res) => {
     const userNo = req.user.userNo;
-
     try {
         const pool = await poolPromise;
-        // 1. جلب قيمة الغرامة من الإعدادات
+        
+        // 👈 جلب قيمة الغرامة وتعريفها
         const settingsRes = await pool.request()
             .query("SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'UnbanFine'");
-        
-        const fineAmount = settingsRes.recordset[0] ? parseInt(settingsRes.recordset[0].ConfigValue) : 5000;
+        const fineAmount = settingsRes.recordset.length > 0 ? parseInt(settingsRes.recordset[0].ConfigValue) : 50000;
 
-        // 2. التحقق من وجود طلب معلق
         const checkPending = await pool.request()
             .input('uid', userNo)
-            .query("SELECT RequestID FROM AdrenalineWeb.dbo.Web_UnbanRequests WHERE UserNo = @uid AND Status = 'Pending'");
-        
+            .query("SELECT * FROM AdrenalineWeb.dbo.Web_UnbanRequests WHERE UserNo = @uid AND Status = 'Pending'");
+
         if (checkPending.recordset.length > 0) {
             return res.status(400).json({ message: 'لديك طلب قيد المراجعة بالفعل، يرجى الانتظار' });
         }
 
-        // 3. التحقق من رصيد اللاعب (👈 التعديل هنا: نتحقق من CashMoney)
-        const userCheck = await pool.request()
+        await pool.request()
             .input('uid', userNo)
-            .query("SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid");
-
-        if (userCheck.recordset.length === 0) {
-            return res.status(404).json({ message: 'بيانات اللاعب غير موجودة' });
-        }
-
-        const currentMoney = userCheck.recordset[0].CashMoney; // 👈 التعديل هنا
-        if (currentMoney < fineAmount) {
-            return res.status(400).json({ message: `رصيدك غير كافٍ. تحتاج إلى ${fineAmount} كاش (GP) لتقديم الطلب.` });
-        }
-
-        // 4. استخدام Transaction لضمان خصم الرصيد وتسجيل الطلب معاً بدون أخطاء
-        const transaction = new sql.Transaction(pool);
-        await transaction.begin();
-
-        try {
-            const request = new sql.Request(transaction);
-
-            // أ. خصم الغرامة فوراً (👈 التعديل هنا: الخصم من CashMoney)
-            await request
-                .input('uid', userNo)
-                .input('fine', fineAmount)
-                .query("UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @fine WHERE UserNo = @uid");
-
-            // ب. إدراج الطلب في قاعدة البيانات
-            await request
-                .input('uid_req', userNo)
-                .input('fine_req', fineAmount)
-                .query(`
-                    INSERT INTO AdrenalineWeb.dbo.Web_UnbanRequests (UserNo, FineAmount, Status, RequestDate)
-                    VALUES (@uid_req, @fine_req, 'Pending', GETDATE())
-                `);
-
-            await transaction.commit();
-            res.json({ status: 'success', message: 'تم إرسال طلب فك الحظر وخصم كاش الغرامة بنجاح كعربون. سيقوم الأدمن بمراجعته.' });
-
-        } catch (err) {
-            await transaction.rollback();
-            throw err;
-        }
-
+            .input('fine', fineAmount) // ✅ الآن سيعمل بشكل سليم
+            .query(`
+                INSERT INTO AdrenalineWeb.dbo.Web_UnbanRequests (UserNo, FineAmount, Status)
+                VALUES (@uid, @fine, 'Pending')
+            `);
+        
+        res.json({ status: 'success', message: 'تم إرسال طلب فك الحظر.' });
     } catch (err) {
-        console.error('Unban Request Error:', err);
         res.status(500).json({ message: 'فشل إرسال الطلب', error: err.message });
     }
 };
