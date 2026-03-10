@@ -1,6 +1,7 @@
 const { poolPromise, sql } = require('../config/db');
 
 // 1. عرض المخزن (آمن، يستخدم input أصلاً)
+// 1. عرض المخزن (تم التحديث لجلب العناصر غير المنتهية فقط)
 exports.getMyInventory = async (req, res) => {
     try {
         const pool = await poolPromise;
@@ -12,11 +13,20 @@ exports.getMyInventory = async (req, res) => {
                 SELECT 
                     UI.SerialNo, UI.ItemId, UI.Count, UI.SealVal, UI.Durability, UI.Status, UI.EndDate,
                     I.ItemName, I.ItemType, 
-                    CASE WHEN UI.EndDate > GETDATE() THEN DATEDIFF(DAY, GETDATE(), UI.EndDate) ELSE 0 END AS DaysLeft,
-                    CASE WHEN UI.EndDate < GETDATE() THEN 1 ELSE 0 END AS IsExpired
+                    
+                    -- بما أننا نجلب العناصر الصالحة فقط، يمكننا تبسيط حساب الأيام
+                    DATEDIFF(DAY, GETDATE(), UI.EndDate) AS DaysLeft,
+                    0 AS IsExpired -- ستكون دائماً 0 لأنها غير منتهية
+                    
                 FROM GameDB.dbo.T_UserItem UI
                 LEFT JOIN GameDB.dbo.T_ItemInfo I ON UI.ItemId = I.ItemId
-                WHERE UI.UserNo = @uid AND UI.Status != 0 AND UI.IsBaseItem = 0
+                
+                -- 👈 إضافة شرط UI.EndDate > GETDATE() هنا
+                WHERE UI.UserNo = @uid 
+                  AND UI.Status != 0 
+                  AND UI.IsBaseItem = 0 
+                  AND UI.EndDate > GETDATE() 
+                  
                 ORDER BY UI.EndDate DESC
             `);
 
@@ -29,27 +39,29 @@ exports.getMyInventory = async (req, res) => {
 };
 
 // 2. ختم السلاح (تم تأمين العمليات المالية والحذف 🛡️)
+// 2. ختم السلاح (يعتمد على الأيام المتبقية من صلاحية السلاح 🛡️)
 exports.sealItem = async (req, res) => {
-    const { serialNo } = req.body;
+    const { serialNo } = req.body; // نكتفي برقم السلاح فقط، السيرفر سيحسب الباقي
     const userNo = req.user.userNo;
 
     try {
         const pool = await poolPromise;
 
-        // أ. جلب تكلفة الختم
+        // أ. جلب تكلفة الختم لليوم الواحد من الإعدادات
         const settingsResult = await pool.request()
             .query(`SELECT ConfigValue FROM AdrenalineWeb.dbo.Web_Settings WHERE ConfigKey = 'SealCost'`);
         
-        const sealCost = settingsResult.recordset.length > 0 
+        const baseSealCost = settingsResult.recordset.length > 0 
             ? parseInt(settingsResult.recordset[0].ConfigValue) 
             : 1000; 
 
-        // ب. التحقق من السلاح ورصيد اللاعب (استخدام input لحماية الاستعلام)
+        // ب. التحقق من السلاح وجلب الأيام المتبقية (استخدام DATEDIFF لحساب الأيام)
         const checkResult = await pool.request()
             .input('serial', serialNo)
             .input('uid', userNo)
             .query(`
-                SELECT UI.SealVal, UI.IsBaseItem, UI.Status, U.CashMoney AS CurrentGP 
+                SELECT UI.SealVal, UI.IsBaseItem, UI.Status, UI.EndDate, U.CashMoney AS CurrentGP,
+                       DATEDIFF(DAY, GETDATE(), UI.EndDate) AS DaysLeft
                 FROM GameDB.dbo.T_UserItem UI
                 JOIN GameDB.dbo.T_User U ON UI.UserNo = U.UserNo
                 WHERE UI.SerialNo = @serial AND UI.UserNo = @uid
@@ -61,37 +73,52 @@ exports.sealItem = async (req, res) => {
         if (item.IsBaseItem) return res.status(400).json({ message: 'لا يمكن ختم العناصر الأساسية' });
         if (item.SealVal !== 0) return res.status(400).json({ message: 'هذا السلاح مختوم بالفعل' });
         
-        if (item.CurrentGP < sealCost) {
-            return res.status(400).json({ message: `رصيدك غير كافٍ. تكلفة الختم: ${sealCost} GP` });
+        // التأكد من أن السلاح لم تنتهِ صلاحيته بعد
+        if (item.DaysLeft <= 0) {
+            return res.status(400).json({ message: 'انتهت صلاحية هذا السلاح ولا يمكن ختمه' });
+        }
+        
+        // 👈 حساب التكلفة بناءً على الأيام المتبقية
+        const sealDays = item.DaysLeft;
+        const totalCost = baseSealCost * sealDays;
+
+        // التحقق من الرصيد
+        if (item.CurrentGP < totalCost) {
+            return res.status(400).json({ message: `رصيدك غير كافٍ. الأيام المتبقية (${sealDays}) وتكلفة الختم هي: ${totalCost} GP` });
         }
 
-        // ج. تنفيذ العملية (Transaction)
+        // ج. تنفيذ العملية (Transaction) لضمان الأمان
         const transaction = new sql.Transaction(pool);
         await transaction.begin();
 
         try {
             const request = new sql.Request(transaction);
 
-            // ✅ إضافة المدخلات الآمنة هنا لتستخدمها جميع الاستعلامات داخل الـ Transaction
-            request.input('cost', sealCost);
+            // إدخال المتغيرات
+            request.input('cost', totalCost);
             request.input('uid', userNo);
             request.input('serial', serialNo);
+            request.input('days', sealDays); // 👈 نمرر الأيام المتبقية للختم
 
-            // 1. خصم تكلفة الختم (استبدال ${} بـ @)
-            await request.query(`
+            // 1. خصم التكلفة الإجمالية (مع الحماية من ثغرة التزامن)
+            const deductRes = await request.query(`
                 UPDATE GameDB.dbo.T_User 
                 SET CashMoney = CashMoney - @cost 
-                WHERE UserNo = @uid
+                WHERE UserNo = @uid AND CashMoney >= @cost
             `);
 
-            // 2. ختم السلاح وتحديث حالته
+            if (deductRes.rowsAffected[0] === 0) {
+                throw new Error('رصيدك غير كافٍ لإتمام عملية الختم.');
+            }
+
+            // 2. ختم السلاح بعدد الأيام المتبقية
             await request.query(`
                 UPDATE GameDB.dbo.T_UserItem 
-                SET SealVal = 1, Status = 1, WeaponSlotNo = 0 
+                SET SealVal = @days, Status = 1, WeaponSlotNo = 0 
                 WHERE SerialNo = @serial
             `);
 
-            // 3. حذفه من جدول التجهيزات
+            // 3. حذفه من جدول التجهيزات (لأنه أصبح مختوماً)
             await request.query(`
                 DELETE FROM GameDB.dbo.T_CharacterEquip 
                 WHERE ItemSerialNo = @serial AND UserNo = @uid
@@ -101,8 +128,9 @@ exports.sealItem = async (req, res) => {
 
             res.json({ 
                 status: 'success', 
-                message: `تم ختم السلاح وإلغاء تجهيزه بنجاح. تم خصم ${sealCost} GP.`,
-                newBalance: item.CurrentGP - sealCost
+                message: `تم ختم السلاح بنجاح للمدة المتبقية (${sealDays} أيام). تم خصم ${totalCost} GP.`,
+                newBalance: item.CurrentGP - totalCost,
+                sealedDays: sealDays // إرسال الأيام للواجهة إذا أردت عرضها
             });
 
         } catch (err) {

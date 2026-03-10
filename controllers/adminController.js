@@ -219,56 +219,10 @@ exports.forceChangeCredentials = async (req, res) => {
         res.status(500).json({ message: 'حدث خطأ أثناء التحديث', error: err.message });
     }
 };
-exports.getAllTickets = async (req, res) => {
-    const { status } = req.query; // ?status=OPEN
-    try {
-        const pool = await poolPromise;
-        let query = `
-            SELECT T.*, U.UserID, U.Nickname 
-            FROM AdrenalineWeb.dbo.Web_Tickets T
-            JOIN GameDB.dbo.T_User U ON T.UserNo = U.UserNo
-        `;
-        
-        if (status) query += ` WHERE T.Status = @status`;
-        query += ` ORDER BY T.LastUpdate DESC`; // الأحدث أولاً
 
-        const request = pool.request();
-        if (status) request.input('status', status);
-
-        const result = await request.query(query);
-        res.json({ status: 'success', tickets: result.recordset });
-    } catch (err) {
-        res.status(500).json({ message: 'خطأ في جلب التذاكر' });
-    }
-};
 
 // 2. رد الأدمن على تذكرة
-exports.adminReplyTicket = async (req, res) => {
-    const { id } = req.params;
-    const { message, newStatus } = req.body; // newStatus: 'ADMIN_REPLY' or 'CLOSED'
-    const adminName = req.user.userId;
 
-    try {
-        const pool = await poolPromise;
-        
-        await pool.request()
-            .input('tid', id)
-            .input('msg', message)
-            .input('status', newStatus || 'ADMIN_REPLY')
-            .query(`
-                INSERT INTO AdrenalineWeb.dbo.Web_TicketReplies (TicketID, IsAdminReply, Message)
-                VALUES (@tid, 1, @msg); -- 1 تعني أدمن
-
-                UPDATE AdrenalineWeb.dbo.Web_Tickets 
-                SET Status = @status, LastUpdate = GETDATE() 
-                WHERE TicketID = @tid;
-            `);
-
-        res.json({ status: 'success', message: 'تم الرد بنجاح' });
-    } catch (err) {
-        res.status(500).json({ message: 'فشل الرد' });
-    }
-};
 // عرض حالة سيرفر اللعبة (الاقتصاد)
 exports.getServerEconomy = async (req, res) => {
     try {

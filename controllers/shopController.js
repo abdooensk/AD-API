@@ -82,7 +82,7 @@ exports.buyItem = async (req, res) => {
 
             // ب. فحص رصيد اللاعب
             reqTx.input('uid', userNo); // نعيد إدخال المتغيرات للـ Request المشترك
-            const userWallet = await reqTx.query("SELECT GameMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid");
+            const userWallet = await reqTx.query("SELECT CashMoney FROM GameDB.dbo.T_User WHERE UserNo = @uid");
 
             if (userWallet.recordset.length === 0) throw new Error('حساب اللاعب غير موجود');
 
@@ -94,7 +94,7 @@ exports.buyItem = async (req, res) => {
 
             // ج. خصم المبلغ
             reqTx.input('price', item.PriceGP);
-            const deductResult = await reqTx.query("UPDATE GameDB.dbo.T_User SET GameMoney = GameMoney - @price WHERE UserNo = @uid AND GameMoney >= @price");
+            const deductResult = await reqTx.query("UPDATE GameDB.dbo.T_User SET CashMoney = CashMoney - @price WHERE UserNo = @uid AND GameMoney >= @price");
             
             // إذا كانت نتيجة الخصم 0 (أي أن الرصيد لم يكن كافياً لحظة التنفيذ الفعلي)، نلغي العملية
             if (deductResult.rowsAffected[0] === 0) {
