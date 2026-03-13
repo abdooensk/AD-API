@@ -113,3 +113,34 @@ exports.getGameFiles = async (req, res) => {
         res.status(500).json({ success: false, message: 'فشل جلب بيانات الحماية' });
     }
 };
+// تحديث النبضة (Heartbeat) القادمة من اللعبة/الجسر
+// تحديث النبضة (Heartbeat) القادمة من اللعبة/الجسر
+exports.heartbeat = async (req, res) => {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ success: false, message: 'No token provided' });
+
+    try {
+        const pool = await poolPromise;
+        
+        // 🔴 استخدام توقيت السيرفر بدلاً من توقيت قاعدة البيانات
+        const currentTime = new Date().toISOString();
+
+        const result = await pool.request()
+            .input('t', token)
+            .input('currentTime', currentTime) // تمرير التوقيت كمتغير
+            .query(`
+                UPDATE AdrenalineWeb.dbo.Web_LaunchTokens 
+                SET LastHeartbeat = @currentTime 
+                WHERE TokenString = @t AND IsValid = 1
+            `);
+
+        if (result.rowsAffected[0] > 0) {
+            res.json({ success: true, message: 'Heartbeat received' });
+        } else {
+            res.status(401).json({ success: false, message: 'Invalid or expired token' });
+        }
+    } catch (err) {
+        console.error('Heartbeat Error:', err.message);
+        res.status(500).json({ success: false });
+    }
+};

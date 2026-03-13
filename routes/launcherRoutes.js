@@ -10,4 +10,5 @@ router.get('/info', launcherController.getLauncherInfo);
 router.post('/generate-token', launcherController.generateLaunchToken);
 router.post('/close-session', launcherController.closeSession); // 🔴 المسار الجديد
 router.get('/files', launcherController.getGameFiles); // 🔴 مسار فحص الملفات
+router.post('/heartbeat', launcherController.heartbeat); // 👈 إضافة مسار النبضة
 module.exports = router;
