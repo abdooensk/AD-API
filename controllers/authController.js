@@ -209,7 +209,6 @@ exports.login = async (req, res) => {
 
 // 2. إنشاء حساب جديد (Register) - (كما هو تماماً في نسختك)
 exports.register = async (req, res) => {
-    // التأكد من استخدام username ليطابق الواجهة
     const { username, password, email, referralCode } = req.body;
 
     if (!username || !password || !email) {
@@ -221,69 +220,70 @@ exports.register = async (req, res) => {
 
         // 1. التحقق من التكرار
         const check = await pool.request()
-    .input('uid', username)
-    .input('email', email)
-    .query('SELECT UserId FROM AuthDB.dbo.T_Account WHERE UserId = @uid OR Email = @email');
+            .input('uid', sql.VarChar, username)
+            .input('email', sql.VarChar, email)
+            .query('SELECT UserId FROM AuthDB.dbo.T_Account WHERE UserId = @uid OR Email = @email');
 
-if (check.recordset.length > 0) {
-    return res.status(400).json({ message: 'اسم المستخدم أو البريد مسجل مسبقاً' });
-}
+        if (check.recordset.length > 0) {
+            return res.status(400).json({ message: 'اسم المستخدم أو البريد مسجل مسبقاً' });
+        }
 
-        // 2. معالجة كود الدعوة (تم تعديلها لتكون آمنة من ثغرات SQL)
+        // 2. معالجة كود الدعوة (بشكل آمن)
         let referrerUserNo = null; 
-        
         if (referralCode) {
             const decodedId = decodeReferralCode(referralCode);
             if (decodedId) {
                 const refCheck = await pool.request()
-                    .input('refId', decodedId)
+                    .input('refId', sql.Int, decodedId)
                     .query(`SELECT UserNo FROM AuthDB.dbo.T_Account WHERE UserNo = @refId`);
                 
-                if (refCheck.recordset.length > 0) {
-                    referrerUserNo = decodedId;
-                }
+                if (refCheck.recordset.length > 0) referrerUserNo = decodedId;
             }
         }
 
-        // 3. الإدخال في قاعدة البيانات
-        const verificationCode = generateOTP(); 
-const hashedPassword = hashPassword(password);
+        // 3. بدء المعاملة (Transaction) لمنع حسابات الأشباح
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
 
-await pool.request()
-    .input('uid', username)
-    .input('pass', hashedPassword)
-    .input('email', email)
-    .input('token', verificationCode) 
-    .input('ref', referrerUserNo) 
-    .query(`
-        INSERT INTO AuthDB.dbo.T_Account 
-        (UserId, Password, Email, IsEmailVerified, VerificationToken, VerificationTokenExpiry, ReferredBy, RegDate, IsBanned)
-        VALUES 
-        (@uid, @pass, @email, 0, @token, DATEADD(MINUTE, 30, GETDATE()), @ref, GETDATE(), 0)
-    `);
+        try {
+            const verificationCode = generateOTP(); 
+            const hashedPassword = hashPassword(password);
+            const request = new sql.Request(transaction);
 
-        // 4. 👈👈 هنا نضع كود إرسال الإيميل (باستخدام القالب الاحترافي)
-        await transporter.sendMail({
-            from: `"Adrenaline Game" <${process.env.EMAIL_USER}>`,
-            to: email,
-            subject: 'أهلاً بك في أدرينالين - كود تفعيل حسابك',
-            html: getEmailTemplate(
-                'تأكيد الحساب الجديد', 
-                username, 
-                'شكراً لانضمامك إلى ساحة المعركة! لتفعيل حسابك والبدء في اللعب، يرجى إدخال الكود التالي:', 
-                verificationCode
-            )
-        });
+            await request
+                .input('uid', sql.VarChar, username)
+                .input('pass', sql.VarChar, hashedPassword)
+                .input('email', sql.VarChar, email)
+                .input('token', sql.VarChar, verificationCode) 
+                .input('ref', sql.Int, referrerUserNo) // 👈 السر هنا: تحديد النوع sql.Int يمنع انهيار السيرفر إذا كان null
+                .query(`
+                    INSERT INTO AuthDB.dbo.T_Account 
+                    (UserId, Password, Email, IsEmailVerified, VerificationToken, VerificationTokenExpiry, ReferredBy, RegDate, IsBanned)
+                    VALUES 
+                    (@uid, @pass, @email, 0, @token, DATEADD(MINUTE, 30, GETDATE()), @ref, GETDATE(), 0)
+                `);
 
-        // 5. إرسال الرد للمستخدم
-        res.json({ status: 'success', message: 'تم التسجيل بنجاح! يرجى التحقق من بريدك لإدخال كود التفعيل.' });
+            // 4. إرسال الإيميل (إذا فشل الإرسال، سيتراجع السيرفر عن إنشاء الحساب)
+            await transporter.sendMail({
+                from: `"Adrenaline Game" <${process.env.EMAIL_USER}>`,
+                to: email,
+                subject: 'أهلاً بك في أدرينالين - كود تفعيل حسابك',
+                html: getEmailTemplate('تأكيد الحساب الجديد', username, 'شكراً لانضمامك إلى ساحة المعركة! لتفعيل حسابك، يرجى إدخال الكود التالي:', verificationCode)
+            });
+
+            await transaction.commit(); // تم كل شيء بنجاح، احفظ في الداتابيز!
+            res.json({ status: 'success', message: 'تم التسجيل بنجاح! يرجى التحقق من بريدك لإدخال كود التفعيل.' });
+
+        } catch (err) {
+            await transaction.rollback(); // إذا حدث خطأ تراجع وامسح الحساب
+            throw err; 
+        }
 
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'فشل التسجيل', error: err.message });
+        console.error("Register Error:", err);
+        res.status(500).json({ message: 'فشل التسجيل. تأكد من صحة البريد الإلكتروني.', error: err.message });
     }
 };
-
 // 3. تفعيل الإيميل (كما هو في نسختك)
 // تحديث: دالة تفعيل الإيميل + مكافأة الداعي
 exports.verifyEmail = async (req, res) => {
